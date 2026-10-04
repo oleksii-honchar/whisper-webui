@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -575,6 +576,191 @@ def test_transcription_request_language_passthrough(tmp_path: Path):
 
     body_auto = capture_body(language="auto")
     assert b'name="language"' not in body_auto
+
+
+# ---------------------------------------------------------------------------
+# T6 — AH-4 observability (spec §3.4 P4/P7/P8, DEC-8).
+# ---------------------------------------------------------------------------
+
+# --- P4: LOG_LEVEL env (default INFO; invalid → INFO) -----------------------
+
+def test_log_level_env_sets_effective_root_level():
+    import main
+
+    try:
+        with patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}):
+            main.setup_logging()
+            assert logging.getLogger().getEffectiveLevel() == logging.DEBUG
+
+        with patch.dict(os.environ, {"LOG_LEVEL": "NOT_A_LEVEL"}):
+            main.setup_logging()
+            assert logging.getLogger().getEffectiveLevel() == logging.INFO
+    finally:
+        os.environ.pop("LOG_LEVEL", None)
+        main.setup_logging()
+        assert logging.getLogger().getEffectiveLevel() == logging.INFO
+
+
+# --- P7 (adapter side): on_progress contract --------------------------------
+
+def _make_openai_transcriber() -> OpenAICompatibleTranscriber:
+    return OpenAICompatibleTranscriber(
+        name="openai",
+        display_name="OpenAI Cloud Whisper",
+        base_url_getter="http://llama-swap:8080/v1",
+        api_key_getter="dummy-key",
+        default_model="whisper-large-v3-turbo",
+        supported_models=["whisper-large-v3-turbo"],
+    )
+
+
+def _ok_response(duration: float) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "text": "ok",
+        "language": "en",
+        "duration": duration,
+        "segments": [],
+    }
+    return resp
+
+
+def test_transcribe_on_progress_compressing_phase_precedes_chunks(tmp_path: Path):
+    """on_progress is called once with phase='compressing', done=0 BEFORE compression,
+    then per chunk with cumulative audio-seconds and phase='chunk'."""
+    input_file = tmp_path / "input.mkv"  # non-audio extension forces the compression path
+    input_file.write_bytes(b"FAKE-MEDIA")
+
+    transcriber = _make_openai_transcriber()
+
+    def fake_subprocess_run(cmd, **kwargs):
+        res = MagicMock()
+        if str(cmd[0]).endswith("ffprobe"):
+            res.stdout = "90.0"
+        else:  # ffmpeg compression: create the (small) output file
+            Path(cmd[-1]).write_bytes(b"\x00" * 100)
+            res.stdout = ""
+        return res
+
+    calls: list[tuple[float, float, str]] = []
+    with (
+        patch("transcribers.openai_compat.subprocess.run", side_effect=fake_subprocess_run),
+        patch("httpx.Client.post", return_value=_ok_response(90.0)),
+    ):
+        result = transcriber.transcribe(
+            input_file,
+            on_progress=lambda done, total, phase: calls.append((done, total, phase)),
+        )
+
+    assert result.text == "ok"
+    assert calls, "on_progress must be called"
+    phases = [c[2] for c in calls]
+    assert set(phases) <= {"compressing", "chunk"}
+    assert phases[0] == "compressing"
+    assert calls[0][0] == 0.0
+    chunk_calls = [c for c in calls if c[2] == "chunk"]
+    assert len(chunk_calls) == 1
+    assert chunk_calls[0][0] == pytest.approx(90.0)  # cumulative audio-seconds
+
+
+def test_transcribe_on_progress_monotonic_cumulative_across_chunks(tmp_path: Path):
+    audio_file = tmp_path / "sample.wav"
+    audio_file.write_bytes(b"RIFF" + b"\x00" * 100)
+
+    chunk1 = tmp_path / "chunk_000.mp3"
+    chunk1.write_bytes(b"\x00" * 10)
+    chunk2 = tmp_path / "chunk_001.mp3"
+    chunk2.write_bytes(b"\x00" * 10)
+
+    transcriber = _make_openai_transcriber()
+
+    def fake_subprocess_run(cmd, **kwargs):
+        res = MagicMock()
+        if str(cmd[0]).endswith("ffprobe"):
+            res.stdout = "60.0"
+        else:
+            Path(cmd[-1]).write_bytes(b"\x00" * 100)
+            res.stdout = ""
+        return res
+
+    responses = iter([_ok_response(60.0), _ok_response(60.0)])
+    calls: list[tuple[float, float, str]] = []
+    with (
+        patch("transcribers.openai_compat.MAX_PAYLOAD_BYTES", 50),
+        patch("transcribers.openai_compat.subprocess.run", side_effect=fake_subprocess_run),
+        patch.object(transcriber, "_split_into_chunks", return_value=[(chunk1, 0.0), (chunk2, 60.0)]),
+        patch("httpx.Client.post", side_effect=lambda *a, **k: next(responses)),
+    ):
+        transcriber.transcribe(
+            audio_file,
+            on_progress=lambda done, total, phase: calls.append((done, total, phase)),
+        )
+
+    chunk_calls = [c for c in calls if c[2] == "chunk"]
+    assert len(chunk_calls) == 2
+    assert [c[0] for c in chunk_calls] == [60.0, 120.0]  # cumulative, monotonic non-decreasing
+    assert all(c[1] == 120.0 for c in chunk_calls)  # total known from chunk plan
+    assert all(c[0] <= c[1] for c in chunk_calls)
+
+
+def test_transcribe_without_on_progress_still_works(tmp_path: Path):
+    """on_progress is an optional kwarg — existing call sites unaffected."""
+    audio_file = tmp_path / "sample.wav"
+    audio_file.write_bytes(b"RIFF" + b"\x00" * 100)
+    transcriber = _make_openai_transcriber()
+    with patch("httpx.Client.post", return_value=_ok_response(1.0)):
+        result = transcriber.transcribe(audio_file)
+    assert result.text == "ok"
+
+
+# --- P8: request timeout from settings (env STT_REQUEST_TIMEOUT, default 600)
+
+def test_stt_request_timeout_setting_default_and_env_override():
+    with patch.dict(os.environ):
+        os.environ.pop("STT_REQUEST_TIMEOUT", None)
+        assert Settings().stt_request_timeout == 600
+
+    with patch.dict(os.environ, {"STT_REQUEST_TIMEOUT": "900"}):
+        assert Settings().stt_request_timeout == 900
+
+
+def test_transcription_request_uses_settings_timeout(tmp_path: Path):
+    """The timeout on the REAL request path (httpx client + MockTransport) comes
+    from settings — not a constant in source."""
+    import httpx
+
+    audio_file = tmp_path / "sample.wav"
+    audio_file.write_bytes(b"RIFF" + b"\x00" * 100)
+    transcriber = _make_openai_transcriber()
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        return httpx.Response(200, json={"text": "ok", "language": "en", "duration": 1.0, "segments": []})
+
+    real_init = httpx.Client.__init__
+
+    def spy_init(self, *args, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        kwargs["transport"] = httpx.MockTransport(handler)
+        real_init(self, *args, **kwargs)
+
+    original = settings.stt_request_timeout
+    try:
+        settings.stt_request_timeout = 424
+        with patch.object(httpx.Client, "__init__", spy_init):
+            data = transcriber._call_transcription_api(
+                file_path=audio_file, model_name="whisper-large-v3-turbo"
+            )
+        assert data["text"] == "ok"  # the request really went through MockTransport
+        assert captured["path"] == "/v1/audio/transcriptions"
+        timeout = captured.get("timeout")
+        assert timeout is not None, "client must be constructed with an explicit timeout"
+        assert timeout.read == 424.0
+    finally:
+        settings.stt_request_timeout = original
 
 
 

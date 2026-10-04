@@ -265,7 +265,8 @@ class OpenAICompatibleTranscriber(BaseTranscriber):
 
         content_type = "audio/mpeg" if file_path.suffix.lower() == ".mp3" else "audio/wav"
 
-        timeout = httpx.Timeout(180.0, connect=15.0)
+        from config import settings
+        timeout = httpx.Timeout(float(settings.stt_request_timeout), connect=15.0)
         with open(file_path, "rb") as f:
             # httpx>=0.28 cannot encode data=list-of-tuples together with files=
             # (TypeError in the multipart encoder). Send the form fields through the
@@ -306,6 +307,10 @@ class OpenAICompatibleTranscriber(BaseTranscriber):
     ) -> TranscriptionResult:
         """Perform audio transcription via OpenAI-compatible REST API.
 
+        Optional kwargs:
+        - on_progress(done_audio_s, total_audio_s, phase): progress callback,
+          phase in {"compressing", "chunk"}; cumulative audio-seconds done.
+
         Automatically handles:
         - In-memory NumPy audio conversion
         - FFmpeg audio compression for payloads exceeding 24MB
@@ -316,6 +321,11 @@ class OpenAICompatibleTranscriber(BaseTranscriber):
             raise RuntimeError(f"{self.display_name} API key is not configured. Please set in Settings.")
 
         chosen_model = model_name or self.default_model
+        on_progress = kwargs.get("on_progress")
+
+        def _emit_progress(done_audio_s: float, total_audio_s: float, phase: str) -> None:
+            if on_progress is not None:
+                on_progress(done_audio_s, total_audio_s, phase)
 
         with tempfile.TemporaryDirectory() as temp_dir_str:
             temp_dir = Path(temp_dir_str)
@@ -342,6 +352,9 @@ class OpenAICompatibleTranscriber(BaseTranscriber):
                     target_file.suffix,
                     self.display_name,
                 )
+                # Total audio duration is not known until the file is probed; emit a
+                # message-only "compressing" signal (done=0, total=0) before compressing.
+                _emit_progress(0.0, 0.0, "compressing")
                 self._compress_to_mp3(target_file, compressed_file)
                 target_file = compressed_file
                 file_size = target_file.stat().st_size
@@ -353,20 +366,35 @@ class OpenAICompatibleTranscriber(BaseTranscriber):
             else:
                 chunks = [(target_file, 0.0)]
 
+            # Probe per-chunk audio durations for honest progress (cumulative audio-seconds).
+            # Only probed when a progress callback is present to avoid extra ffprobe calls.
+            if on_progress is not None:
+                chunk_durations = [self._get_audio_duration(cp) for cp, _ in chunks]
+                total_audio_s = sum(chunk_durations)
+            else:
+                chunk_durations = [0.0] * len(chunks)
+                total_audio_s = 0.0
+
             # 4. Transcribe chunk(s) and aggregate results
             all_segments: list[Segment] = []
             combined_texts: list[str] = []
             detected_language = "auto"
             total_duration = 0.0
             next_seg_id = 0
+            done_audio_s = 0.0
+            num_chunks = len(chunks)
 
-            for chunk_path, time_offset in chunks:
+            for idx, ((chunk_path, time_offset), chunk_audio_dur) in enumerate(
+                zip(chunks, chunk_durations), start=1
+            ):
+                api_start = time.time()
                 data = self._call_transcription_api(
                     file_path=chunk_path,
                     model_name=chosen_model,
                     language=language,
                     request_word_timestamps=True,
                 )
+                api_latency = time.time() - api_start
 
                 chunk_segs, chunk_text, chunk_lang, chunk_dur = self._parse_verbose_json(
                     data=data,
@@ -382,6 +410,16 @@ class OpenAICompatibleTranscriber(BaseTranscriber):
                 if chunk_lang and chunk_lang != "auto":
                     detected_language = chunk_lang
                 total_duration += chunk_dur
+
+                done_audio_s += chunk_audio_dur
+                logger.info(
+                    "Transcribed chunk %d/%d (offset=%.1fs, api_latency=%.2fs)",
+                    idx,
+                    num_chunks,
+                    time_offset,
+                    api_latency,
+                )
+                _emit_progress(done_audio_s, total_audio_s, "chunk")
 
             full_text = " ".join(combined_texts).strip()
 
