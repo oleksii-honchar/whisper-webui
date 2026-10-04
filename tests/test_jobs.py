@@ -2,7 +2,9 @@
 
 import asyncio
 import contextlib
+import functools
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -224,13 +226,17 @@ async def test_chunk_progress_message_only_when_total_audio_unknown(tmp_path: Pa
 # --- P5: per-stage INFO logs with durations (observable contract, caplog) --
 
 @pytest.mark.asyncio
-async def test_run_pipeline_logs_per_stage_durations(caplog, tmp_path: Path):
+async def test_run_pipeline_logs_per_stage_durations(caplog, tmp_path: Path, monkeypatch):
     caplog.set_level(logging.INFO, logger="jobs")
+
+    # T7/P13: the diarize call moved to the process pool — stage logs are
+    # unchanged, only the seam through which the result arrives.
+    import jobs as jobs_module
+    monkeypatch.setattr(jobs_module, "_diarize_worker", _pool_result_worker)
 
     diarizer = MagicMock()
     diarizer.is_available.return_value = True
     diarizer.models_ready.return_value = True
-    diarizer.diarize.return_value = _fake_diarization_result()
 
     manager = JobManager()
     job = manager.create_job("logged.wav")
@@ -257,6 +263,9 @@ async def test_diarization_heartbeat_reports_elapsed_without_fake_percent(monkey
     import jobs as jobs_module
 
     monkeypatch.setattr(jobs_module, "DIARIZATION_HEARTBEAT_SECONDS", 0.05)
+    # T7/P13: the blocking call now runs in the process pool — the heartbeat
+    # contract (elapsed seconds, no fake percents) is unchanged around the pool await.
+    monkeypatch.setattr(jobs_module, "_diarize_worker", _pool_sleeping_worker)
 
     manager = JobManager()
     job = manager.create_job("heartbeat.wav")
@@ -265,12 +274,6 @@ async def test_diarization_heartbeat_reports_elapsed_without_fake_percent(monkey
     diarizer = MagicMock()
     diarizer.is_available.return_value = True
     diarizer.models_ready.return_value = True
-
-    def slow_diarize(audio, **kw):
-        time.sleep(0.3)
-        return _fake_diarization_result()
-
-    diarizer.diarize.side_effect = slow_diarize
 
     await _run_pipeline_with_fakes(
         manager, job.job_id, _tmp_media(tmp_path), diarizer=diarizer, enable_diarization=True
@@ -282,6 +285,148 @@ async def test_diarization_heartbeat_reports_elapsed_without_fake_percent(monkey
     assert all(s["progress"] == 60 for s in heartbeats), "heartbeat must not invent fake percentages"
     elapsed_values = [int(re.search(r"(\d+)s elapsed", s["message"]).group(1)) for s in heartbeats]
     assert elapsed_values == sorted(elapsed_values)
+
+
+# ---------------------------------------------------------------------------
+# T7 — AH-5 (spec §3.4 P13/P14, DEC-9/DEC-10).
+# P13: diarize() must run in a child process (ProcessPoolExecutor), the job
+# result must flow back unchanged, model download stays in the parent, and the
+# T6 heartbeat must keep covering the pool await.
+# Pool workers are module-level so ProcessPoolExecutor can pickle them by
+# reference into the child (spawn start method on macOS).
+# ---------------------------------------------------------------------------
+
+
+def _pool_pid_worker(audio, num_speakers, cluster_threshold):
+    """Runs in the pool child: smuggles the child pid back via num_speakers."""
+    return DiarizationResult(num_speakers=os.getpid(), intervals=[])
+
+
+def _pool_sleeping_worker(audio, num_speakers, cluster_threshold):
+    time.sleep(0.3)
+    return _fake_diarization_result()
+
+
+def _pool_result_worker(audio, num_speakers, cluster_threshold):
+    return _fake_diarization_result()
+
+
+def _pool_record_threshold_worker(audio, num_speakers, cluster_threshold, record_path):
+    """Child-side recorder: persists the threshold the pipeline actually passed."""
+    Path(record_path).write_text(repr(float(cluster_threshold)))
+    return _fake_diarization_result()
+
+
+@pytest.mark.asyncio
+async def test_diarize_runs_in_child_process_and_result_flows_back_unchanged(tmp_path: Path, monkeypatch):
+    import jobs as jobs_module
+
+    monkeypatch.setattr(jobs_module, "_diarize_worker", _pool_pid_worker)
+
+    manager = JobManager()
+    job = manager.create_job("pool.wav")
+
+    diarizer = MagicMock()
+    diarizer.is_available.return_value = True
+    diarizer.models_ready.return_value = True
+
+    await _run_pipeline_with_fakes(
+        manager, job.job_id, _tmp_media(tmp_path), diarizer=diarizer, enable_diarization=True
+    )
+
+    assert job.status == "completed", f"pipeline must complete; got {job.status}: {job.error}"
+    assert job.result is not None, "job result must be present after pool diarization"
+    child_pid = job.result["num_speakers"]
+    assert child_pid != os.getpid(), "diarize() must execute in a child process, not in the parent"
+    assert child_pid > 1, "worker pid must be a real separate process"
+
+
+@pytest.mark.asyncio
+async def test_model_download_stays_in_parent_before_pool_submission(tmp_path: Path, monkeypatch):
+    import jobs as jobs_module
+
+    monkeypatch.setattr(jobs_module, "_diarize_worker", _pool_pid_worker)
+
+    manager = JobManager()
+    job = manager.create_job("download.wav")
+    queue = manager.subscribe(job.job_id)
+
+    diarizer = MagicMock()
+    diarizer.is_available.return_value = True
+    diarizer.models_ready.return_value = False
+
+    await _run_pipeline_with_fakes(
+        manager, job.job_id, _tmp_media(tmp_path), diarizer=diarizer, enable_diarization=True
+    )
+
+    assert job.status == "completed", f"pipeline must complete; got {job.status}: {job.error}"
+    assert diarizer.ensure_models.called, (
+        "models must be downloaded in the parent process before the pool submission"
+    )
+    statuses = _drain_status_events(queue)
+    assert any("Downloading speaker diarization models" in s["message"] for s in statuses), (
+        "download status event must still be emitted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_diarization_heartbeat_covers_process_pool_await(tmp_path: Path, monkeypatch):
+    """T6 integration note: the heartbeat must keep working around the P13 pool await."""
+    import jobs as jobs_module
+
+    monkeypatch.setattr(jobs_module, "DIARIZATION_HEARTBEAT_SECONDS", 0.05)
+    monkeypatch.setattr(jobs_module, "_diarize_worker", _pool_sleeping_worker)
+
+    manager = JobManager()
+    job = manager.create_job("heartbeat_pool.wav")
+    queue = manager.subscribe(job.job_id)
+
+    diarizer = MagicMock()
+    diarizer.is_available.return_value = True
+    diarizer.models_ready.return_value = True
+
+    await _run_pipeline_with_fakes(
+        manager, job.job_id, _tmp_media(tmp_path), diarizer=diarizer, enable_diarization=True
+    )
+    assert job.status == "completed", f"pipeline must complete; got {job.status}: {job.error}"
+
+    statuses = _drain_status_events(queue)
+    heartbeats = [s for s in statuses if "Diarizing" in s["message"] and "elapsed" in s["message"]]
+    assert heartbeats, "expected heartbeat status events while the pool worker is pending"
+    assert all(s["progress"] == 60 for s in heartbeats), "heartbeat must not invent fake percentages"
+    elapsed_values = [int(re.search(r"(\d+)s elapsed", s["message"]).group(1)) for s in heartbeats]
+    assert elapsed_values == sorted(elapsed_values)
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_cluster_threshold_default_resolves_from_settings(tmp_path: Path, monkeypatch):
+    import config as config_module
+    import jobs as jobs_module
+
+    monkeypatch.setattr(config_module.settings, "diarization_threshold", 0.42)
+    record = tmp_path / "threshold.txt"
+    monkeypatch.setattr(
+        jobs_module,
+        "_diarize_worker",
+        functools.partial(_pool_record_threshold_worker, record_path=str(record)),
+    )
+
+    manager = JobManager()
+    job = manager.create_job("threshold.wav")
+
+    diarizer = MagicMock()
+    diarizer.is_available.return_value = True
+    diarizer.models_ready.return_value = True
+
+    await _run_pipeline_with_fakes(
+        manager, job.job_id, _tmp_media(tmp_path), diarizer=diarizer, enable_diarization=True
+    )
+    assert job.status == "completed", f"pipeline must complete; got {job.status}: {job.error}"
+
+    passed = float(record.read_text())
+    assert passed == 0.42, (
+        "run_pipeline's cluster_threshold default must resolve from settings.diarization_threshold"
+    )
 
 
 def test_sherpa_diarizer_logs_start_end_with_duration_and_rtf(caplog):

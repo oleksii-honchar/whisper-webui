@@ -11,6 +11,7 @@ import contextlib
 import logging
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,21 @@ logger = logging.getLogger(__name__)
 # Heartbeat interval for the diarization phase (no sub-progress available from
 # sherpa's blocking process() — report elapsed seconds instead, never fake %).
 DIARIZATION_HEARTBEAT_SECONDS = 30.0
+
+
+def _diarize_worker(audio: Any, num_speakers: int, cluster_threshold: float):
+    """Process-pool worker for the diarization phase (P13, DEC-9).
+
+    Module-level so ProcessPoolExecutor can pickle it by reference into the
+    child; the diarizer is constructed IN-CHILD and the blocking sherpa
+    process() runs there — off the event loop's GIL, so the UI/SSE feed stays
+    responsive while diarization runs. Model download stays in the parent
+    (run_pipeline calls ensure_models before submitting).
+    """
+    from diarization import diarizer_factory
+
+    diarizer = diarizer_factory.get_diarizer("sherpa-onnx")
+    return diarizer.diarize(audio, num_speakers=num_speakers, cluster_threshold=cluster_threshold)
 
 
 @dataclass
@@ -158,7 +174,7 @@ class JobManager:
         vad_filter: bool = True,
         enable_diarization: bool = False,
         num_speakers: int = -1,
-        cluster_threshold: float = 0.5,
+        cluster_threshold: float | None = None,
         ai_action: str = "summary",  # raw, polish, summary
         summary_level: str = "bullets",
         llm_provider: str = "ollama",
@@ -168,6 +184,12 @@ class JobManager:
         job = self.get_job(job_id)
         if not job:
             return
+
+        # The clustering threshold's default is settings.diarization_threshold —
+        # the setting is live end-to-end, no hardcoded constant (P14, DEC-10).
+        from config import settings
+        if cluster_threshold is None:
+            cluster_threshold = settings.diarization_threshold
 
         start_time = time.time()
         audio_processor = AudioProcessor()
@@ -188,7 +210,6 @@ class JobManager:
                 convert_start = time.time()
                 transcriber = transcriber_factory.get_transcriber(whisper_engine)
 
-                from config import settings
                 from audio_processor import HAS_NUMPY
 
                 use_memory = settings.use_in_memory_pcm and HAS_NUMPY and whisper_engine == "faster-whisper"
@@ -261,19 +282,27 @@ class JobManager:
                         if diarizer.is_available():
                             if hasattr(diarizer, "models_ready") and not diarizer.models_ready():
                                 self.update_status(job_id, "diarizing", 52, "Downloading speaker diarization models on demand (first run only)...")
+                                # Model download stays in the parent (thread pool —
+                                # network I/O): the process-pool child must never
+                                # re-download (P13).
+                                await loop.run_in_executor(None, diarizer.ensure_models)
                             else:
                                 self.update_status(job_id, "diarizing", 60, "Identifying speakers (diarization)...")
                             heartbeat_task = asyncio.create_task(self._diarization_heartbeat(job_id))
                             diarize_start = time.time()
                             try:
-                                diar_result = await loop.run_in_executor(
-                                    None,
-                                    lambda: diarizer.diarize(
+                                # P13 (DEC-9): the blocking sherpa process() runs in a
+                                # child process — the GIL no longer freezes the UI/SSE
+                                # feed while diarization runs. Heartbeat keeps covering
+                                # the pool await (try/finally preserved from T6).
+                                with ProcessPoolExecutor(max_workers=1) as pool:
+                                    diar_result = await loop.run_in_executor(
+                                        pool,
+                                        _diarize_worker,
                                         audio_input,
-                                        num_speakers=num_speakers,
-                                        cluster_threshold=cluster_threshold,
-                                    ),
-                                )
+                                        num_speakers,
+                                        cluster_threshold,
+                                    )
                             finally:
                                 heartbeat_task.cancel()
                                 with contextlib.suppress(asyncio.CancelledError):
