@@ -1,5 +1,12 @@
 /* Custom application styles */
 
+/* AH-6: cap the results panel to one viewport height, scroll internally.
+   Offset = sticky header (h-16 = 4rem) + main vertical padding (py-8 x2 = 4rem). */
+#results-container {
+  max-height: calc(100vh - 8rem);
+  overflow-y: auto;
+}
+
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px;
 }
