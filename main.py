@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import time
 import uuid
@@ -31,10 +32,21 @@ from notifications import dispatcher, NotificationPayload, TelegramNotifier, Web
 from jobs import job_manager
 from diarization import diarizer_factory, align_speakers_to_segments
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+def setup_logging() -> None:
+    """Configure root logging. LOG_LEVEL env selects the level (default INFO;
+    an invalid value falls back to INFO)."""
+    level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, level_name, None)
+    if not isinstance(level, int):
+        level = logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True,
+    )
+
+
+setup_logging()
 logger = logging.getLogger("transcriber")
 
 app = FastAPI(

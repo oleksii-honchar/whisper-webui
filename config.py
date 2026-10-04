@@ -98,6 +98,9 @@ class Settings(BaseModel):
     use_in_memory_pcm: bool = Field(
         default_factory=lambda: bool(_whisper_cfg.get("use_in_memory_pcm", True))
     )
+    stt_request_timeout: int = Field(
+        default_factory=lambda: int(os.getenv("STT_REQUEST_TIMEOUT", "600"))
+    )
     whisper_models_dir: Path = Field(
         default_factory=lambda: Path(_whisper_cfg.get("models_dir") or os.getenv("WHISPER_MODELS_DIR", str(MODELS_DIR)))
     )
