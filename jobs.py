@@ -7,6 +7,7 @@ streaming real-time progress and transcribed segments via Server-Sent Events.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
@@ -22,6 +23,10 @@ from transcribers.base import Segment
 from llm import llm_registry, get_polish_prompt, ChunkedSummarizer
 
 logger = logging.getLogger(__name__)
+
+# Heartbeat interval for the diarization phase (no sub-progress available from
+# sherpa's blocking process() — report elapsed seconds instead, never fake %).
+DIARIZATION_HEARTBEAT_SECONDS = 30.0
 
 
 @dataclass
@@ -133,6 +138,16 @@ class JobManager:
         job.message = message
         self.emit(job_id, "status", {"status": status, "progress": progress, "message": message})
 
+    async def _diarization_heartbeat(self, job_id: str) -> None:
+        """Re-emit the diarizing status with elapsed seconds while the blocking
+        sherpa process() is pending. No fake percentages — sherpa exposes no
+        sub-progress; elapsed time is the only honest signal."""
+        started = time.monotonic()
+        while True:
+            await asyncio.sleep(DIARIZATION_HEARTBEAT_SECONDS)
+            elapsed = int(time.monotonic() - started)
+            self.update_status(job_id, "diarizing", 60, f"Diarizing… {elapsed}s elapsed")
+
     async def run_pipeline(
         self,
         job_id: str,
@@ -159,9 +174,18 @@ class JobManager:
         converted_wav: Path | None = None
 
         try:
+            # Queue waits become visible: the Job already models "queued" — emit it
+            # BEFORE acquiring the semaphore so saturated queues are observable (P6).
+            self.update_status(job_id, "queued", 5, "Waiting in queue...")
+            logger.info(
+                "Job %s started: engine=%s model=%s language=%s",
+                job_id, whisper_engine, whisper_model, language or "auto",
+            )
+
             async with self.semaphore:
                 # 1. Convert audio
                 self.update_status(job_id, "converting", 15, "Decoding audio with FFmpeg...")
+                convert_start = time.time()
                 transcriber = transcriber_factory.get_transcriber(whisper_engine)
 
                 from config import settings
@@ -177,6 +201,10 @@ class JobManager:
                     metadata = audio_processor.probe_media(media_path)
 
                 job.duration = metadata.duration
+                logger.info(
+                    "Job %s: audio converted in %.2fs (duration=%.1fs)",
+                    job_id, time.time() - convert_start, job.duration,
+                )
 
                 # 2. Transcribe with live segment streaming
                 self.update_status(job_id, "transcribing", 35, "Transcribing with Whisper...")
@@ -184,8 +212,26 @@ class JobManager:
                 def on_segment_callback(seg: Segment):
                     self.emit(job_id, "segment", seg.model_dump())
 
+                def on_progress_callback(done_audio_s: float, total_audio_s: float, phase: str) -> None:
+                    # Map adapter progress into the 35→50 band; message-only when the
+                    # total audio duration is not (yet) known — no invented percents.
+                    if phase == "compressing":
+                        self.update_status(job_id, "transcribing", 35, "Compressing audio for upload...")
+                        return
+                    if total_audio_s > 0:
+                        progress = min(50, 35 + int(15 * done_audio_s / total_audio_s))
+                        self.update_status(
+                            job_id,
+                            "transcribing",
+                            progress,
+                            f"Transcribing audio... {done_audio_s:.0f}/{total_audio_s:.0f}s",
+                        )
+                    else:
+                        self.update_status(job_id, "transcribing", 35, "Transcribing audio...")
+
                 # Run CPU-bound transcription in threadpool to avoid blocking event loop
                 loop = asyncio.get_running_loop()
+                transcribe_start = time.time()
                 transcription_result = await loop.run_in_executor(
                     None,
                     lambda: transcriber.transcribe(
@@ -194,7 +240,16 @@ class JobManager:
                         language=language if language != "auto" else None,
                         vad_filter=vad_filter,
                         on_segment=on_segment_callback,
+                        on_progress=on_progress_callback,
                     ),
+                )
+                transcribe_elapsed = time.time() - transcribe_start
+                logger.info(
+                    "Job %s: transcription done in %.2fs: %d segments, RTF %.3f",
+                    job_id,
+                    transcribe_elapsed,
+                    len(transcription_result.segments),
+                    transcribe_elapsed / job.duration if job.duration > 0 else 0.0,
                 )
 
                 # 2.5 Speaker Diarization
@@ -208,16 +263,31 @@ class JobManager:
                                 self.update_status(job_id, "diarizing", 52, "Downloading speaker diarization models on demand (first run only)...")
                             else:
                                 self.update_status(job_id, "diarizing", 60, "Identifying speakers (diarization)...")
-                            diar_result = await loop.run_in_executor(
-                                None,
-                                lambda: diarizer.diarize(
-                                    audio_input,
-                                    num_speakers=num_speakers,
-                                    cluster_threshold=cluster_threshold,
-                                ),
-                            )
+                            heartbeat_task = asyncio.create_task(self._diarization_heartbeat(job_id))
+                            diarize_start = time.time()
+                            try:
+                                diar_result = await loop.run_in_executor(
+                                    None,
+                                    lambda: diarizer.diarize(
+                                        audio_input,
+                                        num_speakers=num_speakers,
+                                        cluster_threshold=cluster_threshold,
+                                    ),
+                                )
+                            finally:
+                                heartbeat_task.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await heartbeat_task
                             align_speakers_to_segments(transcription_result.segments, diar_result)
                             num_speakers_detected = diar_result.num_speakers
+                            diarize_elapsed = time.time() - diarize_start
+                            logger.info(
+                                "Job %s: diarization done in %.2fs: RTF %.3f, %d speakers",
+                                job_id,
+                                diarize_elapsed,
+                                diarize_elapsed / job.duration if job.duration > 0 else 0.0,
+                                num_speakers_detected,
+                            )
                             self.emit(job_id, "diarization", {
                                 "num_speakers": diar_result.num_speakers,
                                 "speakers": diar_result.speaker_names,
@@ -307,6 +377,7 @@ class JobManager:
             job_result["processing_time"] = elapsed
             job.result = job_result
 
+            logger.info("Job %s completed in %.2fs", job_id, elapsed)
             self.update_status(job_id, "completed", 100, f"Completed in {elapsed}s")
             self.emit(job_id, "completed", job_result)
 

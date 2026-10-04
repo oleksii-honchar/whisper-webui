@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import wave
 from pathlib import Path
 from typing import Any
@@ -194,7 +195,10 @@ class SherpaDiarizer(BaseDiarizer):
             raise RuntimeError(f"Sherpa-ONNX Diarization config validation failed: {config}")
 
         sd = sherpa_onnx.OfflineSpeakerDiarization(config)
+        logger.info("Diarization started for %.1fs of audio (single blocking process call)", duration_sec)
+        process_start = time.monotonic()
         raw_result = sd.process(samples)
+        process_elapsed = time.monotonic() - process_start
 
         intervals: list[SpeakerInterval] = []
         for segment in raw_result.sort_by_start_time():
@@ -208,6 +212,12 @@ class SherpaDiarizer(BaseDiarizer):
             )
 
         num_detected = raw_result.num_speakers if raw_result.num_speakers > 0 else len({i.speaker for i in intervals})
+        logger.info(
+            "Diarization done in %.2fs: RTF %.3f, %d speakers",
+            process_elapsed,
+            process_elapsed / duration_sec if duration_sec > 0 else 0.0,
+            num_detected,
+        )
 
         return DiarizationResult(
             num_speakers=num_detected,
