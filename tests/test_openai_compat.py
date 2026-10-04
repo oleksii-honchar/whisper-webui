@@ -529,3 +529,52 @@ def test_transcription_request_multipart_body_encodes(tmp_path: Path):
     assert b'filename="sample.wav"' in body
 
 
+def test_language_selector_offers_ukrainian_and_russian():
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert 'value="auto"' in resp.text
+    assert 'value="uk"' in resp.text
+    assert 'value="ru"' in resp.text
+
+
+def test_transcription_request_language_passthrough(tmp_path: Path):
+    """Explicit language must be sent in the multipart body; 'auto' must omit it
+    so the STT server performs autodetection."""
+    import httpx
+
+    audio_file = tmp_path / "sample.wav"
+    audio_file.write_bytes(b"RIFF" + b"\x00" * 100)
+
+    transcriber = OpenAICompatibleTranscriber(
+        name="openai",
+        display_name="OpenAI Cloud Whisper",
+        base_url_getter="http://llama-swap:8080/v1",
+        api_key_getter="dummy-key",
+        default_model="whisper-large-v3-turbo",
+        supported_models=["whisper-large-v3-turbo"],
+    )
+
+    def capture_body(**call_kwargs) -> bytes:
+        captured: dict = {}
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"text": "ok", "language": "uk", "duration": 1.0, "segments": []}
+
+        def capture_post(self, url, **kwargs):
+            req = httpx.Request("POST", url, **kwargs)
+            captured["body"] = req.read()
+            return mock_response
+
+        with patch("httpx.Client.post", new=capture_post):
+            transcriber._call_transcription_api(file_path=audio_file, model_name="whisper-large-v3-turbo", **call_kwargs)
+        return captured["body"]
+
+    body_uk = capture_body(language="uk")
+    assert b'name="language"' in body_uk
+    assert b"\r\nuk\r\n" in body_uk
+
+    body_auto = capture_body(language="auto")
+    assert b'name="language"' not in body_auto
+
+
+
