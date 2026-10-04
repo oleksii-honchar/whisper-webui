@@ -54,8 +54,8 @@ class TranscriberFactory:
                 display_name="OpenAI Cloud Whisper",
                 base_url_getter=lambda: settings.openai_base_url,
                 api_key_getter=lambda: settings.openai_api_key,
-                default_model="whisper-1",
-                supported_models=["whisper-1"],
+                default_model=settings.openai_default_stt_model,
+                supported_models=list(dict.fromkeys([settings.openai_default_stt_model, "whisper-1"])),
             ),
         }
 

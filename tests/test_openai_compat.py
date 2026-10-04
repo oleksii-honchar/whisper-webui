@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -10,12 +11,12 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from config import get_masked_settings, mask_secret, save_config, settings
+from config import Settings, get_masked_settings, mask_secret, save_config, settings
 from llm import llm_registry
 from llm.openai_compat import OpenAICompatibleLLMProvider
 from main import app
 from transcribers.base import Segment
-from transcribers.factory import transcriber_factory
+from transcribers.factory import TranscriberFactory, transcriber_factory
 from transcribers.openai_compat import OpenAICompatibleTranscriber
 
 client = TestClient(app)
@@ -423,4 +424,62 @@ async def test_openai_llm_provider_exclude_keywords():
     with patch("httpx.AsyncClient.get", return_value=mock_resp):
         models = await provider.list_models()
         assert models == ["chat-main", "chat-secondary"]
+
+
+# --- Config-driven OpenAI STT model (pattern parity with groq/openrouter profiles) ---
+
+CUSTOM_STT_MODEL = "whisper-large-v3-turbo"
+
+
+def test_openai_default_stt_model_env_override_and_default():
+    # Default must stay "whisper-1" when no override is present
+    with patch.dict(os.environ):
+        os.environ.pop("OPENAI_DEFAULT_STT_MODEL", None)
+        assert Settings().openai_default_stt_model == "whisper-1"
+
+    # Env override configures the model, mirroring GROQ_DEFAULT_STT_MODEL
+    with patch.dict(os.environ, {"OPENAI_DEFAULT_STT_MODEL": CUSTOM_STT_MODEL}):
+        assert Settings().openai_default_stt_model == CUSTOM_STT_MODEL
+
+
+def test_openai_engine_profile_honors_configured_default_stt_model():
+    original = settings.openai_default_stt_model
+    try:
+        settings.openai_default_stt_model = CUSTOM_STT_MODEL
+        factory = TranscriberFactory()
+        engine = factory.get_engine("openai")
+        assert engine.default_model == CUSTOM_STT_MODEL
+        models = factory.get_models_for_engine("openai")
+        assert models[0] == CUSTOM_STT_MODEL
+        assert "whisper-1" in models
+    finally:
+        settings.openai_default_stt_model = original
+
+
+def test_api_whisper_models_openai_lists_configured_model():
+    original = settings.openai_default_stt_model
+    try:
+        settings.openai_default_stt_model = CUSTOM_STT_MODEL
+        with patch("main.transcriber_factory", TranscriberFactory()):
+            resp = client.get("/api/whisper/models?engine=openai")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["engine"] == "openai"
+        assert data["models"] == [CUSTOM_STT_MODEL, "whisper-1"]
+    finally:
+        settings.openai_default_stt_model = original
+
+
+def test_api_whisper_models_openai_default_unchanged_without_override():
+    resp = client.get("/api/whisper/models?engine=openai")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["engine"] == "openai"
+    assert data["models"] == ["whisper-1"]
+
+
+def test_openai_compatible_settings_export_includes_default_stt_model():
+    cfg = get_masked_settings()
+    assert "default_stt_model" in cfg["openai_compatible"]
+    assert cfg["openai_compatible"]["default_stt_model"] == settings.openai_default_stt_model
 

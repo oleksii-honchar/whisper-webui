@@ -128,6 +128,9 @@ class Settings(BaseModel):
     openai_default_model: str = Field(
         default_factory=lambda: _openai_cfg.get("default_model") or os.getenv("OPENAI_DEFAULT_MODEL", "gpt-4o-mini")
     )
+    openai_default_stt_model: str = Field(
+        default_factory=lambda: _openai_cfg.get("default_stt_model") or os.getenv("OPENAI_DEFAULT_STT_MODEL", "whisper-1")
+    )
 
     # Cloud STT & LLM - Groq
     groq_api_key: str | None = Field(
@@ -288,6 +291,7 @@ def get_masked_settings() -> dict[str, Any]:
             "api_key": mask_secret(settings.openai_api_key),
             "base_url": settings.openai_base_url,
             "default_model": settings.openai_default_model,
+            "default_stt_model": settings.openai_default_stt_model,
         }
 
     return cfg
