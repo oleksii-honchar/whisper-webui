@@ -1,0 +1,25 @@
+# Keep the build context minimal and reproducible.
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Local config carries personal credentials — never bake it into the image.
+config.json
+*.local.json
+
+# Local binaries, downloaded models, user uploads, logs.
+bin/
+models/
+uploads/
+*.log
+
+# Not needed in the image.
+docs/
+tests/
+TODO.md
