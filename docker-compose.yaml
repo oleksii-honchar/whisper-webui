@@ -1,0 +1,38 @@
+# Local development compose for whisper-webui (fork, patched/main).
+#
+# In-container paths verified against the app code @ f0e6797 (config.py):
+#   - BASE_DIR = /app            (Dockerfile WORKDIR; config.py:18 anchors to config.py location)
+#   - models   -> /app/models    (config.py:20 MODELS_DIR; WHISPER_MODELS_DIR override config.py:102;
+#                                 diarization ONNX models auto-download here on first use)
+#   - uploads  -> /app/uploads   (config.py:21 UPLOADS_DIR; job media + converted wavs live here —
+#                                 this is the app's only on-disk output area; srt/vtt/json exports
+#                                 are generated in-memory, main.py:545-548)
+#   - config   -> /app/config.json is a SINGLE FILE, not a directory (config.py:24).
+#                 The app falls back to environment variables when config.json is absent
+#                 (config.py:44-45), so settings are passed via `environment:` below.
+#                 To persist settings saved from the UI instead, uncomment the bind mount
+#                 after creating the file: `cp config.json.example config.json`.
+services:
+  whisper-webui:
+    build: .
+    image: tuiteraz/whisper-webui:local-dev
+    container_name: whisper-webui-dev
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # OpenAI-compatible STT backend (e.g. llama-swap). Defaults are local-dev
+      # placeholders — override via your shell env or an .env file.
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://host.docker.internal:8080/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-local-dev-dummy-key}
+      OPENAI_DEFAULT_STT_MODEL: ${OPENAI_DEFAULT_STT_MODEL:-whisper-large-v3-turbo}
+      # Engine selection: openai = remote STT; without this the app prefers local faster-whisper.
+      DEFAULT_WHISPER_ENGINE: ${DEFAULT_WHISPER_ENGINE:-openai}
+      WHISPER_MODELS_DIR: /app/models
+    volumes:
+      - whisper-webui-models:/app/models
+      - whisper-webui-uploads:/app/uploads
+      # - ./config.json:/app/config.json   # optional: persist UI-saved settings (see header)
+
+volumes:
+  whisper-webui-models:
+  whisper-webui-uploads:
