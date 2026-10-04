@@ -1,5 +1,8 @@
 """Unit and integration tests for speaker diarization and speaker-aware features."""
 
+import os
+from unittest.mock import MagicMock, patch
+
 import pytest
 import numpy as np
 from diarization.base import SpeakerInterval, DiarizationResult
@@ -147,6 +150,103 @@ def test_sherpa_diarizer_inference_dummy_silence():
     res = diarizer.diarize(silence)
     assert isinstance(res, DiarizationResult)
     assert isinstance(res.intervals, list)
+
+
+# ---------------------------------------------------------------------------
+# T7 — AH-5 diarization performance + quality (spec §3.4 P10-P14, DEC-9/DEC-10).
+# Behavior assertions only: settings values, kwargs observed on the real
+# construction path, thresholds resolved through real call paths.
+# ---------------------------------------------------------------------------
+
+
+def _fake_sherpa_module() -> MagicMock:
+    """Fully mocked sherpa_onnx module — config constructors record kwargs,
+    OfflineSpeakerDiarization.process returns an empty result."""
+    fake_sherpa = MagicMock()
+    processed = fake_sherpa.OfflineSpeakerDiarization.return_value.process.return_value
+    processed.sort_by_start_time.return_value = []
+    processed.num_speakers = 0
+    return fake_sherpa
+
+
+# --- P10: new settings exist with spec defaults and env overrides -----------
+
+def test_diarization_threads_provider_settings_defaults(monkeypatch):
+    monkeypatch.delenv("DIARIZATION_NUM_THREADS", raising=False)
+    monkeypatch.delenv("DIARIZATION_PROVIDER", raising=False)
+    from config import Settings
+
+    s = Settings()
+    assert s.diarization_num_threads == min(8, os.cpu_count() or 1)
+    assert s.diarization_provider == "cpu"
+
+
+def test_diarization_threads_provider_env_overrides(monkeypatch):
+    monkeypatch.setenv("DIARIZATION_NUM_THREADS", "3")
+    monkeypatch.setenv("DIARIZATION_PROVIDER", "cuda")
+    from config import Settings
+
+    s = Settings()
+    assert s.diarization_num_threads == 3
+    assert s.diarization_provider == "cuda"
+
+
+# --- P14 (settings half): threshold default raised 0.5 → 0.75 ---------------
+
+def test_diarization_threshold_setting_default_is_075(monkeypatch):
+    monkeypatch.delenv("DIARIZATION_THRESHOLD", raising=False)
+    from config import Settings
+
+    assert Settings().diarization_threshold == 0.75
+
+
+# --- P11: num_threads/provider threaded into BOTH sherpa model configs ------
+
+def test_diarizer_threads_provider_passed_to_both_sherpa_configs(monkeypatch):
+    import config as config_module
+    from diarization.sherpa_diarizer import SherpaDiarizer
+
+    monkeypatch.setattr(config_module.settings, "diarization_num_threads", 7)
+    monkeypatch.setattr(config_module.settings, "diarization_provider", "cuda")
+
+    fake_sherpa = _fake_sherpa_module()
+    samples = np.zeros(32000, dtype=np.float32)  # 2.0 s — above the short-audio guard
+
+    with (
+        patch("diarization.sherpa_diarizer.sherpa_onnx", fake_sherpa),
+        patch.object(SherpaDiarizer, "models_ready", return_value=True),
+    ):
+        SherpaDiarizer().diarize(samples)
+
+    seg_kwargs = fake_sherpa.OfflineSpeakerSegmentationModelConfig.call_args.kwargs
+    emb_kwargs = fake_sherpa.SpeakerEmbeddingExtractorConfig.call_args.kwargs
+    assert seg_kwargs.get("num_threads") == 7, "segmentation config must receive num_threads"
+    assert seg_kwargs.get("provider") == "cuda", "segmentation config must receive provider"
+    assert emb_kwargs.get("num_threads") == 7, "embedding config must receive num_threads"
+    assert emb_kwargs.get("provider") == "cuda", "embedding config must receive provider"
+
+
+# --- P14 (diarize half): cluster_threshold default resolves from settings ---
+
+def test_diarize_cluster_threshold_default_resolves_from_settings(monkeypatch):
+    import config as config_module
+    from diarization.sherpa_diarizer import SherpaDiarizer
+
+    monkeypatch.setattr(config_module.settings, "diarization_threshold", 0.42)
+
+    fake_sherpa = _fake_sherpa_module()
+    samples = np.zeros(32000, dtype=np.float32)
+
+    with (
+        patch("diarization.sherpa_diarizer.sherpa_onnx", fake_sherpa),
+        patch.object(SherpaDiarizer, "models_ready", return_value=True),
+    ):
+        SherpaDiarizer().diarize(samples)  # no cluster_threshold passed
+
+    clustering_kwargs = fake_sherpa.FastClusteringConfig.call_args.kwargs
+    assert clustering_kwargs.get("threshold") == 0.42, (
+        "diarize() default must resolve from settings.diarization_threshold, not a hardcoded constant"
+    )
 
 
 def test_job_manager_rename_speaker():

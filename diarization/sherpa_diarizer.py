@@ -155,12 +155,18 @@ class SherpaDiarizer(BaseDiarizer):
         self,
         audio: Path | Any,
         num_speakers: int = -1,
-        cluster_threshold: float = 0.5,
+        cluster_threshold: float | None = None,
         **kwargs: Any,
     ) -> DiarizationResult:
         """Run offline speaker diarization and return temporal intervals."""
         if not self.is_available():
             raise RuntimeError("SherpaDiarizer is not available. Please install 'sherpa-onnx'.")
+
+        # The single source of truth for the clustering threshold is
+        # settings.diarization_threshold (config.json / DIARIZATION_THRESHOLD);
+        # callers may override explicitly, but there is no hardcoded default (P14).
+        if cluster_threshold is None:
+            cluster_threshold = settings.diarization_threshold
 
         if not self.models_ready():
             logger.info("Diarization models not found locally; downloading on demand...")
@@ -174,14 +180,20 @@ class SherpaDiarizer(BaseDiarizer):
             logger.info("Audio duration (%.2fs) too short for diarization; returning empty result", duration_sec)
             return DiarizationResult(num_speakers=0, intervals=[])
 
+        # Threading/provider are config-driven (P10/P11, DEC-9): the fork set
+        # neither before, leaving sherpa-onnx single-threaded on CPU.
         config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
             segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
                 pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
                     model=str(self.segmentation_model_path)
                 ),
+                num_threads=settings.diarization_num_threads,
+                provider=settings.diarization_provider,
             ),
             embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                model=str(self.embedding_model_path)
+                model=str(self.embedding_model_path),
+                num_threads=settings.diarization_num_threads,
+                provider=settings.diarization_provider,
             ),
             clustering=sherpa_onnx.FastClusteringConfig(
                 num_clusters=num_speakers,

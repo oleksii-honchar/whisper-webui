@@ -196,7 +196,13 @@ class Settings(BaseModel):
         default_factory=lambda: _diarization_cfg.get("emb_model") or os.getenv("DIARIZATION_EMB_MODEL", "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx")
     )
     diarization_threshold: float = Field(
-        default_factory=lambda: float(_diarization_cfg.get("threshold", 0.5) if _diarization_cfg.get("threshold") is not None else os.getenv("DIARIZATION_THRESHOLD", "0.5"))
+        default_factory=lambda: float(_diarization_cfg.get("threshold", 0.75) if _diarization_cfg.get("threshold") is not None else os.getenv("DIARIZATION_THRESHOLD", "0.75"))
+    )
+    diarization_num_threads: int = Field(
+        default_factory=lambda: int(_diarization_cfg.get("num_threads") or os.getenv("DIARIZATION_NUM_THREADS", str(min(8, os.cpu_count() or 1))))
+    )
+    diarization_provider: str = Field(
+        default_factory=lambda: _diarization_cfg.get("provider") or os.getenv("DIARIZATION_PROVIDER", "cpu")
     )
 
 

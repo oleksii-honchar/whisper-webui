@@ -275,7 +275,7 @@ async def create_background_job(
     vad_filter: bool = Form(default=True),
     enable_diarization: bool = Form(default=True),
     num_speakers: int = Form(default=-1),
-    cluster_threshold: float = Form(default=0.5),
+    cluster_threshold: float | None = Form(default=None),
     ai_action: str = Form(default="summary"),
     summary_level: str = Form(default="bullets"),
     llm_provider: str = Form(default="ollama"),
@@ -286,6 +286,11 @@ async def create_background_job(
 
     Returns immediately with job_id so clients can track real-time progress.
     """
+    # Unset threshold → settings.diarization_threshold (config.json /
+    # DIARIZATION_THRESHOLD env); an explicit client value still wins (P14).
+    if cluster_threshold is None:
+        cluster_threshold = settings.diarization_threshold
+
     job = job_manager.create_job(file.filename)
     ext = Path(file.filename).suffix or ".wav"
     temp_upload = UPLOADS_DIR / f"{job.job_id}_upload{ext}"
