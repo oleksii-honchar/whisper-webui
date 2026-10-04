@@ -483,3 +483,49 @@ def test_openai_compatible_settings_export_includes_default_stt_model():
     assert "default_stt_model" in cfg["openai_compatible"]
     assert cfg["openai_compatible"]["default_stt_model"] == settings.openai_default_stt_model
 
+
+def test_transcription_request_multipart_body_encodes(tmp_path: Path):
+    """Regression (httpx>=0.28): the request built for /audio/transcriptions must encode a
+    real multipart body. httpx 0.28 raises TypeError when data=list-of-tuples is combined
+    with files=, which mocked-post tests never exercise. Build the actual httpx.Request
+    from the captured call kwargs and encode it."""
+    import httpx
+
+    audio_file = tmp_path / "sample.wav"
+    audio_file.write_bytes(b"RIFF" + b"\x00" * 100)
+
+    transcriber = OpenAICompatibleTranscriber(
+        name="openai",
+        display_name="OpenAI Cloud Whisper",
+        base_url_getter="http://llama-swap:8080/v1",
+        api_key_getter="dummy-key",
+        default_model="whisper-large-v3-turbo",
+        supported_models=["whisper-large-v3-turbo"],
+    )
+
+    captured: dict = {}
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"text": "ok", "language": "en", "duration": 1.0, "segments": []}
+
+    def capture_post(self, url, **kwargs):
+        # Encode the real request while the file handle is still open, exactly as a
+        # live httpx.Client.post would — this is what raises on httpx 0.28 when
+        # data=list-of-tuples is combined with files=.
+        req = httpx.Request("POST", url, **kwargs)
+        captured["body"] = req.read()
+        return mock_response
+
+    with patch("httpx.Client.post", new=capture_post):
+        transcriber._call_transcription_api(file_path=audio_file, model_name="whisper-large-v3-turbo")
+
+    body = captured["body"]
+
+    assert b'name="model"' in body
+    assert b"whisper-large-v3-turbo" in body
+    assert b'name="response_format"' in body
+    assert b"verbose_json" in body
+    assert body.count(b'name="timestamp_granularities[]"') == 2
+    assert b'filename="sample.wav"' in body
+
+

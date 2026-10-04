@@ -267,9 +267,14 @@ class OpenAICompatibleTranscriber(BaseTranscriber):
 
         timeout = httpx.Timeout(180.0, connect=15.0)
         with open(file_path, "rb") as f:
-            files = {"file": (file_path.name, f, content_type)}
+            # httpx>=0.28 cannot encode data=list-of-tuples together with files=
+            # (TypeError in the multipart encoder). Send the form fields through the
+            # same multipart list: a (None, value) tuple renders as a plain field
+            # and keeps repeated keys like timestamp_granularities[].
+            files: list[tuple[str, tuple]] = [("file", (file_path.name, f, content_type))]
+            files += [(name, (None, value)) for name, value in form_data]
             with httpx.Client(timeout=timeout) as client:
-                resp = client.post(url, headers=headers, data=form_data, files=files)
+                resp = client.post(url, headers=headers, files=files)
 
         # Graceful fallback: some providers fail if timestamp_granularities[] is passed
         if resp.status_code == 400 and request_word_timestamps:
