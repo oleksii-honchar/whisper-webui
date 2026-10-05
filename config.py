@@ -204,6 +204,21 @@ class Settings(BaseModel):
     diarization_provider: str = Field(
         default_factory=lambda: _diarization_cfg.get("provider") or os.getenv("DIARIZATION_PROVIDER", "cpu")
     )
+    # AH-11b (R1, DEC-14): engine switch — sherpa-onnx stays the rollback-safe default.
+    diarization_engine: str = Field(
+        default_factory=lambda: _diarization_cfg.get("engine") or os.getenv("DIARIZATION_ENGINE", "sherpa-onnx")
+    )
+    diarization_api_url: str = Field(
+        default_factory=lambda: _diarization_cfg.get("api_url") or os.getenv("DIARIZATION_API_URL", "")
+    )
+    diarization_request_timeout: int = Field(
+        default_factory=lambda: int(_diarization_cfg.get("request_timeout") if _diarization_cfg.get("request_timeout") is not None else os.getenv("DIARIZATION_REQUEST_TIMEOUT", "300"))
+    )
+    # AH-11b′ (R1′, DEC-15): de-blip floor for the remote engine — per-speaker TOTAL
+    # duration below this is dropped; 0 disables the filter. Explicit-0-safe pattern.
+    diarization_min_speaker_duration: float = Field(
+        default_factory=lambda: float(_diarization_cfg.get("min_speaker_duration") if _diarization_cfg.get("min_speaker_duration") is not None else os.getenv("DIARIZATION_MIN_SPEAKER_DURATION", "2.0"))
+    )
 
 
 # Global singleton settings instance

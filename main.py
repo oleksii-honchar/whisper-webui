@@ -537,7 +537,8 @@ async def transcribe_audio(
         num_speakers_detected = 0
         if enable_diarization:
             try:
-                diarizer = diarizer_factory.get_diarizer("sherpa-onnx")
+                # R4 (DEC-14): engine resolved from settings (rollback = one env var).
+                diarizer = diarizer_factory.get_diarizer(settings.diarization_engine)
                 if diarizer.is_available():
                     diar_res = diarizer.diarize(audio_input, num_speakers=num_speakers)
                     align_speakers_to_segments(result.segments, diar_res)

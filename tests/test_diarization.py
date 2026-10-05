@@ -1,11 +1,17 @@
 """Unit and integration tests for speaker diarization and speaker-aware features."""
 
+import contextlib
+import io
+import json
 import os
+import threading
+import wave
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 import numpy as np
-from diarization.base import SpeakerInterval, DiarizationResult
+from diarization.base import BaseDiarizer, SpeakerInterval, DiarizationResult
 from diarization.factory import diarizer_factory
 from diarization.alignment import compute_overlap, align_speakers_to_segments
 from diarization.sherpa_diarizer import SherpaDiarizer
@@ -270,3 +276,525 @@ def test_job_manager_rename_speaker():
     assert "<v Alice>Hello</v>" in updated_result["vtt"]
     assert "[Alice]:" in updated_result["text"]
     assert updated_result["speaker_turns"][0]["speaker"] == "Alice"
+
+
+# ---------------------------------------------------------------------------
+# T10 — AH-11b remote engine + de-blip filter (spec §3.5 R1/R1'/R2/R2'/R3/
+# R4/R5/R7', DEC-14/DEC-15). Mocked httpx (MockTransport) — no live sidecar.
+# Behavior assertions only; the filter tests are the canonical implementation
+# of the rule RG proved offline (test-strategy-ah11b.md).
+# ---------------------------------------------------------------------------
+
+API_URL = "http://sidecar.test:8000"
+
+
+def _payload(intervals, num_speakers):
+    return {"num_speakers": num_speakers, "intervals": intervals}
+
+
+def _iv(start, end, speaker):
+    return {"start": start, "end": end, "speaker": speaker}
+
+
+def _mock_transport(payload, captured=None):
+    """httpx.MockTransport answering POST /diarize; optionally records requests."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if captured is not None:
+            captured.append(request)
+        return httpx.Response(200, json=payload)
+
+    return httpx.MockTransport(handler)
+
+
+def _remote(monkeypatch, payload, captured=None, floor=None, api_url=API_URL):
+    import config as config_module
+
+    monkeypatch.setattr(config_module.settings, "diarization_api_url", api_url)
+    if floor is not None:
+        monkeypatch.setattr(config_module.settings, "diarization_min_speaker_duration", floor)
+
+    from diarization.remote_diarizer import RemoteDiarizer
+
+    return RemoteDiarizer(transport=_mock_transport(payload, captured))
+
+
+# --- R7'(a): response → DiarizationResult shape (filter off: raw passthrough) ---
+
+def test_remote_diarizer_maps_response_to_diarization_result(monkeypatch):
+    payload = _payload(
+        [_iv(0.0, 6.0, "spk0"), _iv(6.5, 12.0, "spk1")],
+        2,
+    )
+    diarizer = _remote(monkeypatch, payload, floor=0.0)
+    result = diarizer.diarize(np.zeros(1600, dtype=np.float32))
+
+    assert isinstance(result, DiarizationResult)
+    assert result.num_speakers == 2
+    assert [(i.start, i.end, i.speaker) for i in result.intervals] == [
+        (0.0, 6.0, "spk0"),
+        (6.5, 12.0, "spk1"),
+    ]
+
+
+def test_remote_diarizer_posts_to_api_url_diarize_endpoint(monkeypatch):
+    captured = []
+    diarizer = _remote(monkeypatch, _payload([], 0), captured, floor=0.0)
+    diarizer.diarize(np.zeros(1600, dtype=np.float32))
+
+    assert len(captured) == 1
+    assert str(captured[0].url) == f"{API_URL}/diarize"
+    assert captured[0].headers["content-type"].startswith("multipart/")
+
+
+# --- R7'(b): is_available() gated on settings.diarization_api_url, no probe ---
+
+def test_remote_diarizer_is_available_false_without_api_url(monkeypatch):
+    import config as config_module
+
+    monkeypatch.setattr(config_module.settings, "diarization_api_url", "")
+    from diarization.remote_diarizer import RemoteDiarizer
+
+    assert RemoteDiarizer().is_available() is False
+
+
+def test_remote_diarizer_is_available_true_with_api_url(monkeypatch):
+    import config as config_module
+
+    monkeypatch.setattr(config_module.settings, "diarization_api_url", API_URL)
+    from diarization.remote_diarizer import RemoteDiarizer
+
+    # No health probe: availability is config presence alone.
+    assert RemoteDiarizer().is_available() is True
+
+
+# --- R7'(c): float32 ndarray → valid WAV multipart (stdlib wave round-trip) ---
+
+def _multipart_file_bytes(request: httpx.Request, field_name: str = "file") -> bytes:
+    body = request.read()
+    boundary = request.headers["content-type"].split("boundary=")[1].strip('"').encode()
+    for part in body.split(b"--" + boundary):
+        if f'name="{field_name}"'.encode() in part:
+            _, _, data = part.partition(b"\r\n\r\n")
+            return data[: -2] if data.endswith(b"\r\n") else data
+    raise AssertionError(f"multipart body has no '{field_name}' field")
+
+
+def test_remote_diarizer_uploads_valid_wav_for_ndarray_input(monkeypatch):
+    captured = []
+    diarizer = _remote(monkeypatch, _payload([], 0), captured, floor=0.0)
+
+    # Deterministic ramp signal, 0.1 s @ 16 kHz float32
+    samples = (np.arange(1600, dtype=np.float32) / 1600.0) - 0.5
+    diarizer.diarize(samples)
+
+    wav_bytes = _multipart_file_bytes(captured[0])
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        assert wf.getnchannels() == 1
+        assert wf.getsampwidth() == 2  # int16
+        assert wf.getframerate() == 16000
+        assert wf.getnframes() == 1600
+        decoded = np.frombuffer(wf.readframes(1600), dtype=np.int16).astype(np.float64)
+
+    expected = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16).astype(np.float64)
+    max_err = np.max(np.abs(decoded - expected))
+    assert max_err <= 1.0, f"int16 round-trip error too large: {max_err}"
+
+
+def test_remote_diarizer_uploads_file_bytes_for_path_input(monkeypatch, tmp_path):
+    captured = []
+    diarizer = _remote(monkeypatch, _payload([], 0), captured, floor=0.0)
+
+    wav_path = tmp_path / "audio.wav"
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(np.zeros(800, dtype=np.int16).tobytes())
+    original = wav_path.read_bytes()
+
+    diarizer.diarize(wav_path)
+
+    uploaded = _multipart_file_bytes(captured[0])
+    assert uploaded == original, "Path input must be uploaded as the file's own bytes"
+
+
+# --- R7'(f): de-blip filter (R2′) — canonical implementation of the RG rule ---
+
+def test_filter_drops_blip_speaker_below_floor(monkeypatch):
+    # Mirrors the RG case: spk2 = 1 interval, 0.51 s total (RG: t=340.42).
+    payload = _payload(
+        [
+            _iv(0.0, 10.0, "spk0"),
+            _iv(12.0, 16.0, "spk1"),
+            _iv(20.0, 25.0, "spk0"),
+            _iv(340.42, 340.93, "spk2"),
+        ],
+        3,
+    )
+    diarizer = _remote(monkeypatch, payload, floor=2.0)
+    result = diarizer.diarize(np.zeros(1600, dtype=np.float32))
+
+    assert result.num_speakers == 2
+    assert all(i.speaker != "spk2" for i in result.intervals), "blip speaker must be dropped"
+    assert len(result.intervals) == 3
+
+
+def test_filter_preserves_short_turns_of_kept_speakers(monkeypatch):
+    # Per-SPEAKER, not per-interval: a 0.3 s turn of a kept speaker survives.
+    payload = _payload(
+        [
+            _iv(0.0, 8.0, "spkA"),
+            _iv(10.0, 14.0, "spkB"),
+            _iv(30.0, 30.3, "spkA"),
+        ],
+        2,
+    )
+    diarizer = _remote(monkeypatch, payload, floor=2.0)
+    result = diarizer.diarize(np.zeros(1600, dtype=np.float32))
+
+    assert result.num_speakers == 2
+    assert len(result.intervals) == 3, "short turns of KEPT speakers must be preserved"
+    # Survivors are re-labeled in arrival order: spkA → spk0, spkB → spk1.
+    assert [i.speaker for i in result.intervals] == ["spk0", "spk1", "spk0"]
+    short = [i for i in result.intervals if i.end - i.start < 1.0]
+    assert len(short) == 1 and short[0].speaker == "spk0", (
+        "the kept speaker's short turn must survive the filter"
+    )
+
+
+def test_filter_relabels_survivors_in_arrival_order_and_recounts(monkeypatch):
+    # Arrival order of survivors: spk5 first, then spk9 (spk1 dropped: 0.4 s).
+    payload = _payload(
+        [
+            _iv(0.0, 6.0, "spk5"),
+            _iv(10.0, 10.4, "spk1"),
+            _iv(20.0, 25.0, "spk9"),
+        ],
+        3,
+    )
+    diarizer = _remote(monkeypatch, payload, floor=2.0)
+    result = diarizer.diarize(np.zeros(1600, dtype=np.float32))
+
+    assert result.num_speakers == 2
+    assert [i.speaker for i in result.intervals] == ["spk0", "spk1"], (
+        "survivors must be re-labeled in arrival order"
+    )
+
+
+def test_filter_disabled_when_floor_is_zero(monkeypatch):
+    payload = _payload(
+        [
+            _iv(0.0, 10.0, "spk0"),
+            _iv(12.0, 16.0, "spk1"),
+            _iv(340.42, 340.93, "spk2"),
+        ],
+        3,
+    )
+    diarizer = _remote(monkeypatch, payload, floor=0.0)
+    result = diarizer.diarize(np.zeros(1600, dtype=np.float32))
+
+    assert result.num_speakers == 3
+    assert [i.speaker for i in result.intervals] == ["spk0", "spk1", "spk2"], (
+        "floor 0 must disable the filter entirely (raw labels preserved)"
+    )
+
+
+def test_filter_all_speakers_below_floor_yields_empty_result(monkeypatch):
+    payload = _payload(
+        [_iv(0.0, 0.5, "spk0"), _iv(1.0, 1.4, "spk1")],
+        2,
+    )
+    diarizer = _remote(monkeypatch, payload, floor=2.0)
+    result = diarizer.diarize(np.zeros(1600, dtype=np.float32))
+
+    assert result.num_speakers == 0
+    assert result.intervals == []
+
+
+# --- R7'(g): settings round-trip — config.json dict + env (P10 pattern) ---
+
+def test_diarization_engine_settings_defaults(monkeypatch):
+    for var in (
+        "DIARIZATION_ENGINE",
+        "DIARIZATION_API_URL",
+        "DIARIZATION_REQUEST_TIMEOUT",
+        "DIARIZATION_MIN_SPEAKER_DURATION",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    from config import Settings
+
+    s = Settings()
+    assert s.diarization_engine == "sherpa-onnx"  # rollback-safe default (DEC-14)
+    assert s.diarization_api_url == ""
+    assert s.diarization_request_timeout == 300
+    assert s.diarization_min_speaker_duration == 2.0
+
+
+def test_diarization_engine_settings_env_overrides(monkeypatch):
+    monkeypatch.setenv("DIARIZATION_ENGINE", "remote")
+    monkeypatch.setenv("DIARIZATION_API_URL", API_URL)
+    monkeypatch.setenv("DIARIZATION_REQUEST_TIMEOUT", "42")
+    monkeypatch.setenv("DIARIZATION_MIN_SPEAKER_DURATION", "0")
+    from config import Settings
+
+    s = Settings()
+    assert s.diarization_engine == "remote"
+    assert s.diarization_api_url == API_URL
+    assert s.diarization_request_timeout == 42
+    assert s.diarization_min_speaker_duration == 0.0
+
+
+def test_diarization_engine_settings_config_json_overrides(monkeypatch):
+    import config as config_module
+
+    monkeypatch.setattr(
+        config_module,
+        "_diarization_cfg",
+        {
+            "engine": "remote",
+            "api_url": API_URL,
+            "request_timeout": 77,
+            "min_speaker_duration": 1.5,
+        },
+    )
+    s = config_module.Settings()
+    assert s.diarization_engine == "remote"
+    assert s.diarization_api_url == API_URL
+    assert s.diarization_request_timeout == 77
+    assert s.diarization_min_speaker_duration == 1.5
+
+
+# --- R5: factory registration ---
+
+def test_remote_engine_registered_in_factory(monkeypatch):
+    import config as config_module
+
+    monkeypatch.setattr(config_module.settings, "diarization_api_url", "")
+    engines = diarizer_factory.list_engines()
+    entry = next((e for e in engines if e["name"] == "remote"), None)
+    assert entry is not None, "remote engine must be registered in the factory"
+    assert entry["available"] is False  # no API URL configured in this test env
+
+
+# --- R3: use_process_pool capability flags ---
+
+def test_use_process_pool_capability_flags():
+    from diarization.remote_diarizer import RemoteDiarizer
+
+    assert SherpaDiarizer.use_process_pool is True, "sherpa keeps the P13 process pool"
+    assert RemoteDiarizer.use_process_pool is False, "remote engine must use the thread path"
+
+
+# --- R4: engine resolution at the three call sites (jobs.py:44, jobs.py:281, main.py:540) ---
+
+def test_diarize_worker_resolves_engine_by_name():
+    """jobs.py:44 — the pool worker resolves the engine through the factory,
+    not a hardcoded constant."""
+    from jobs import _diarize_worker
+
+    marker = DiarizationResult(num_speakers=7, intervals=[])
+
+    class _ProbeDiarizer(BaseDiarizer):
+        name = "probe-engine"
+        use_process_pool = True
+
+        def is_available(self):
+            return True
+
+        def diarize(self, audio, num_speakers=-1, cluster_threshold=0.5, **kwargs):
+            return marker
+
+    diarizer_factory.register(_ProbeDiarizer.name, _ProbeDiarizer)
+    result = _diarize_worker(np.zeros(16, dtype=np.float32), -1, 0.5, "probe-engine")
+    assert result.num_speakers == 7, "worker must call the engine resolved by name from the factory"
+
+
+def _fake_transcription_result():
+    return TranscriptionResult(
+        text="hello world",
+        segments=[Segment(id=0, start=0.0, end=5.0, text="seg 0")],
+        language="en",
+        duration=120.0,
+    )
+
+
+def _fake_diarization_result():
+    return DiarizationResult(
+        num_speakers=2,
+        intervals=[
+            SpeakerInterval(start=0.0, end=5.0, speaker="spk0"),
+            SpeakerInterval(start=5.5, end=10.0, speaker="spk1"),
+        ],
+    )
+
+
+async def _run_pipeline_with_fakes(manager, job_id, media_path, *, diarizer, get_diarizer_patch=None):
+    """Drive run_pipeline with all external dependencies faked (test_jobs pattern)."""
+    from jobs import JobManager
+
+    fake_transcriber = MagicMock()
+    fake_transcriber.name = "openai"
+    fake_transcriber.transcribe.side_effect = lambda audio, **kw: _fake_transcription_result()
+
+    audio_processor = MagicMock()
+    audio_processor.convert_to_whisper_wav.side_effect = lambda src, dst: dst
+    metadata = MagicMock()
+    metadata.duration = 120.0
+    audio_processor.probe_media.return_value = metadata
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("jobs.AudioProcessor", return_value=audio_processor))
+        stack.enter_context(patch("jobs.transcriber_factory.get_transcriber", return_value=fake_transcriber))
+        if get_diarizer_patch is not None:
+            stack.enter_context(patch("diarization.diarizer_factory.get_diarizer", get_diarizer_patch))
+        else:
+            stack.enter_context(patch("diarization.diarizer_factory.get_diarizer", return_value=diarizer))
+        stack.enter_context(patch("diarization.align_speakers_to_segments"))
+        await manager.run_pipeline(
+            job_id,
+            media_path,
+            whisper_engine="openai",
+            whisper_model="whisper-large-v3-turbo",
+            language="uk",
+            enable_diarization=True,
+            ai_action="raw",
+        )
+
+
+def _tmp_media(tmp_path, name="job_audio.wav"):
+    media = tmp_path / name
+    media.write_bytes(b"RIFF" + b"\x00" * 100)
+    return media
+
+
+def _available_diarizer_mock():
+    diarizer = MagicMock()
+    diarizer.is_available.return_value = True
+    diarizer.models_ready.return_value = True
+    return diarizer
+
+
+async def test_run_pipeline_resolves_diarizer_engine_from_settings(tmp_path, monkeypatch):
+    """jobs.py:281 — factory must receive settings.diarization_engine, not a constant."""
+    import config as config_module
+    from jobs import JobManager
+
+    monkeypatch.setattr(config_module.settings, "diarization_engine", "test-engine")
+
+    diarizer = _available_diarizer_mock()
+    diarizer.use_process_pool = False
+    diarizer.diarize.return_value = _fake_diarization_result()
+    get_spy = MagicMock(return_value=diarizer)
+
+    manager = JobManager()
+    job = manager.create_job("engine.wav")
+    await _run_pipeline_with_fakes(
+        manager, job.job_id, _tmp_media(tmp_path), diarizer=diarizer, get_diarizer_patch=get_spy
+    )
+
+    assert job.status == "completed", f"pipeline must complete; got {job.status}: {job.error}"
+    requested = [c.args[0] for c in get_spy.call_args_list if c.args]
+    assert "test-engine" in requested, (
+        "run_pipeline must resolve the engine from settings.diarization_engine"
+    )
+
+
+async def test_sync_transcribe_endpoint_resolves_engine_from_settings(tmp_path, monkeypatch):
+    """main.py:540 — the synchronous /api/transcribe path must resolve the engine from settings."""
+    import config as config_module
+
+    monkeypatch.setattr(config_module.settings, "diarization_engine", "test-engine")
+
+    diarizer = _available_diarizer_mock()
+    diarizer.diarize.return_value = _fake_diarization_result()
+    get_spy = MagicMock(return_value=diarizer)
+
+    fake_transcriber = MagicMock()
+    fake_transcriber.name = "openai"
+    fake_transcriber.transcribe.return_value = _fake_transcription_result()
+
+    audio_processor = MagicMock()
+    audio_processor.convert_to_whisper_wav.side_effect = lambda src, dst: dst
+    metadata = MagicMock()
+    metadata.duration = 1.0
+    audio_processor.probe_media.return_value = metadata
+
+    from fastapi.testclient import TestClient
+    from main import app
+
+    client = TestClient(app)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("main.transcriber_factory.get_transcriber", return_value=fake_transcriber))
+        stack.enter_context(patch("main.audio_processor", audio_processor))
+        stack.enter_context(patch("diarization.diarizer_factory.get_diarizer", get_spy))
+
+        response = client.post(
+            "/api/transcribe",
+            files={"file": ("t.wav", b"RIFF" + b"\x00" * 100, "audio/wav")},
+            data={"whisper_engine": "openai", "whisper_model": "m", "enable_diarization": "true"},
+        )
+
+    assert response.status_code == 200, f"endpoint must serve the job; got {response.status_code}"
+    requested = [c.args[0] for c in get_spy.call_args_list if c.args]
+    assert "test-engine" in requested, (
+        "/api/transcribe must resolve the engine from settings.diarization_engine"
+    )
+
+
+# --- R4: executor branch on use_process_pool ---
+
+async def test_thread_executor_used_when_use_process_pool_false(tmp_path, monkeypatch):
+    """Remote-style engine (use_process_pool=False) must run in a worker THREAD
+    of the SAME process — not a child process, not the main thread."""
+    from jobs import JobManager
+
+    record = tmp_path / "executor.json"
+    diarizer = _available_diarizer_mock()
+    diarizer.use_process_pool = False
+
+    def _record_and_result(audio, *args, **kwargs):
+        rec = {
+            "pid": os.getpid(),
+            "is_main_thread": threading.current_thread() is threading.main_thread(),
+        }
+        record.write_text(json.dumps(rec))
+        return _fake_diarization_result()
+
+    diarizer.diarize.side_effect = _record_and_result
+
+    manager = JobManager()
+    job = manager.create_job("thread.wav")
+    await _run_pipeline_with_fakes(manager, job.job_id, _tmp_media(tmp_path), diarizer=diarizer)
+
+    assert job.status == "completed", f"pipeline must complete; got {job.status}: {job.error}"
+    rec = json.loads(record.read_text())
+    assert rec["pid"] == os.getpid(), "thread executor must run in the same process"
+    assert rec["is_main_thread"] is False, "diarize() must run in a worker thread, not the event loop"
+
+
+def _pool_pid_worker(audio, num_speakers, cluster_threshold, engine):
+    import os as _os
+
+    return DiarizationResult(num_speakers=_os.getpid(), intervals=[])
+
+
+async def test_sherpa_path_still_runs_in_child_process(tmp_path, monkeypatch):
+    """P13 regression: use_process_pool=True keeps the ProcessPoolExecutor path
+    (worker pid ≠ parent pid)."""
+    import jobs as jobs_module
+    from jobs import JobManager
+
+    monkeypatch.setattr(jobs_module, "_diarize_worker", _pool_pid_worker)
+
+    diarizer = _available_diarizer_mock()
+    diarizer.use_process_pool = True
+
+    manager = JobManager()
+    job = manager.create_job("pool.wav")
+    await _run_pipeline_with_fakes(manager, job.job_id, _tmp_media(tmp_path), diarizer=diarizer)
+
+    assert job.status == "completed", f"pipeline must complete; got {job.status}: {job.error}"
+    child_pid = job.result["num_speakers"]
+    assert child_pid != os.getpid(), "process-pool engine must run in a child process"
+    assert child_pid > 1, "worker pid must be a real separate process"

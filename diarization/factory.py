@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Type
 from diarization.base import BaseDiarizer
 from diarization.sherpa_diarizer import SherpaDiarizer
+from diarization.remote_diarizer import RemoteDiarizer
 
 
 class DiarizerFactory:
@@ -14,6 +15,7 @@ class DiarizerFactory:
         self._engines: dict[str, Type[BaseDiarizer]] = {}
         self._instances: dict[str, BaseDiarizer] = {}
         self.register(SherpaDiarizer.name, SherpaDiarizer)
+        self.register(RemoteDiarizer.name, RemoteDiarizer)
 
     def register(self, name: str, diarizer_cls: Type[BaseDiarizer]) -> None:
         self._engines[name.lower()] = diarizer_cls

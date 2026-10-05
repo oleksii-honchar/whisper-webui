@@ -297,21 +297,21 @@ async def test_diarization_heartbeat_reports_elapsed_without_fake_percent(monkey
 # ---------------------------------------------------------------------------
 
 
-def _pool_pid_worker(audio, num_speakers, cluster_threshold):
+def _pool_pid_worker(audio, num_speakers, cluster_threshold, engine):
     """Runs in the pool child: smuggles the child pid back via num_speakers."""
     return DiarizationResult(num_speakers=os.getpid(), intervals=[])
 
 
-def _pool_sleeping_worker(audio, num_speakers, cluster_threshold):
+def _pool_sleeping_worker(audio, num_speakers, cluster_threshold, engine):
     time.sleep(0.3)
     return _fake_diarization_result()
 
 
-def _pool_result_worker(audio, num_speakers, cluster_threshold):
+def _pool_result_worker(audio, num_speakers, cluster_threshold, engine):
     return _fake_diarization_result()
 
 
-def _pool_record_threshold_worker(audio, num_speakers, cluster_threshold, record_path):
+def _pool_record_threshold_worker(audio, num_speakers, cluster_threshold, engine, record_path):
     """Child-side recorder: persists the threshold the pipeline actually passed."""
     Path(record_path).write_text(repr(float(cluster_threshold)))
     return _fake_diarization_result()

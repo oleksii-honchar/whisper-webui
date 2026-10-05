@@ -36,6 +36,12 @@ class BaseDiarizer(ABC):
 
     name: str = "base"
     display_name: str = "Base Diarizer"
+    # Capability flag for the executor choice in jobs.run_pipeline (R3, DEC-14):
+    # True  -> ProcessPoolExecutor (blocking in-process engines, P13/GIL);
+    # False -> thread executor (HTTP-backed engines — no GIL problem, and no
+    #          pickling of ~183 MB audio samples into a child process).
+    # SherpaDiarizer inherits True unchanged; RemoteDiarizer overrides to False.
+    use_process_pool: bool = True
 
     @abstractmethod
     def is_available(self) -> bool:
