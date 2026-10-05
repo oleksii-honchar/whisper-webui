@@ -205,31 +205,32 @@ def test_sync_transcribe_diarization_uses_settings_threshold(monkeypatch, tmp_pa
 
 
 # ---------------------------------------------------------------------------
-# AH-6 — Cap the results panel to one viewport height with internal scroll.
-# User: "limit id=\"results-container\" to 1 window height and enable scroll
-# for the rest of the content". Served HTML must reference the cache-bumped
-# stylesheet, and the served stylesheet must constrain #results-container to a
-# viewport-relative max-height with internal overflow scrolling (AH-3
-# TestClient served-HTML pattern).
+# AH-6/AH-7 — Cap the results panel and scroll internally.
+# AH-6: "limit id=\"results-container\" to 1 window height and enable scroll
+# for the rest of the content". AH-7 refines the cap: "actually scrollable 0.5
+# of window height should be id=\"results-container\"" → max-height 50vh.
+# Served HTML must reference the cache-bumped stylesheet, and the served
+# stylesheet must constrain #results-container to 50vh with internal overflow
+# scrolling (AH-3 TestClient served-HTML pattern).
 # ---------------------------------------------------------------------------
 
 
 def test_index_page_cache_busts_stylesheet_for_results_cap():
     response = client.get("/")
     assert response.status_code == 200
-    assert "/static/style.css?v=5.1" in response.text, (
-        "index.html must bump the style.css cache-bust version when the results-cap rule ships"
+    assert "/static/style.css?v=5.2" in response.text, (
+        "index.html must bump the style.css cache-bust version when the results-cap rule changes"
     )
 
 
-def test_served_css_caps_results_container_to_one_viewport():
+def test_served_css_caps_results_container_to_half_viewport():
     response = client.get("/static/style.css")
     assert response.status_code == 200
     rule = re.search(r"#results-container\s*\{([^}]*)\}", response.text)
     assert rule, "style.css must contain a #results-container rule"
     body = rule.group(1)
-    assert re.search(r"max-height\s*:\s*[^;]*vh", body), (
-        "#results-container max-height must be viewport-relative (e.g. calc(100vh - ...))"
+    assert re.search(r"max-height\s*:\s*50vh", body), (
+        "#results-container max-height must be 50vh (half the window height, per AH-7)"
     )
     assert re.search(r"overflow-y\s*:\s*auto", body), (
         "#results-container must scroll its overflow internally"

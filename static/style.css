@@ -1,9 +1,9 @@
 /* Custom application styles */
 
-/* AH-6: cap the results panel to one viewport height, scroll internally.
-   Offset = sticky header (h-16 = 4rem) + main vertical padding (py-8 x2 = 4rem). */
+/* AH-6/AH-7: cap the results panel to half the window height, scroll internally
+   ("actually scrollable 0.5 of window height should be id=\"results-container\""). */
 #results-container {
-  max-height: calc(100vh - 8rem);
+  max-height: 50vh;
   overflow-y: auto;
 }
 
