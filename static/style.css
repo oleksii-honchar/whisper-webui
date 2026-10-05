@@ -1,9 +1,23 @@
 /* Custom application styles */
 
-/* AH-6/AH-7: cap the results panel to half the window height, scroll internally
-   ("actually scrollable 0.5 of window height should be id=\"results-container\""). */
+/* AH-6/AH-7/AH-8: cap the results panel to half the window height, pin its
+   header, and let ONLY the result viewports scroll ("only id=\"viewport-transcript\"
+   should be scrollable, but currently id=\"results-container\" is scrollabel and
+   header ... is hidden when scrolling"). */
 #results-container {
   max-height: 50vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#results-header {
+  flex: 0 0 auto;
+}
+#viewport-transcript,
+#viewport-polish,
+#viewport-summary {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
 }
 

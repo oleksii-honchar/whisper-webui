@@ -10,7 +10,7 @@
   <script src="https://unpkg.com/lucide@latest"></script>
   <!-- Marked for Markdown rendering -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <link rel="stylesheet" href="/static/style.css?v=5.2">
+  <link rel="stylesheet" href="/static/style.css?v=5.3">
 </head>
 <body class="h-full flex flex-col font-sans antialiased selection:bg-indigo-500 selection:text-white">
 
@@ -306,7 +306,7 @@
     <div id="results-container" class="hidden bg-slate-900/50 border border-slate-800 rounded-2xl p-6 backdrop-blur-sm shadow-xl space-y-6">
       
       <!-- Results Header & Tabs -->
-      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
+      <div id="results-header" class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
         <div class="flex space-x-1.5 border border-slate-800 p-1 rounded-xl bg-slate-950/60">
           <button id="res-tab-transcript" class="res-tab active px-3.5 py-2 rounded-lg text-xs font-medium text-indigo-400 bg-indigo-500/10 flex items-center gap-1.5 transition-all">
             <i data-lucide="file-text" class="w-3.5 h-3.5"></i>
@@ -362,7 +362,7 @@
             </label>
           </div>
         </div>
-        <div id="transcript-segments-list" class="space-y-2 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar"></div>
+        <div id="transcript-segments-list" class="space-y-2 pr-2 custom-scrollbar"></div>
         <div id="transcript-plain-text" class="hidden text-sm text-slate-200 leading-relaxed whitespace-pre-wrap"></div>
       </div>
 

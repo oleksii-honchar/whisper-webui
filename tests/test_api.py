@@ -205,33 +205,68 @@ def test_sync_transcribe_diarization_uses_settings_threshold(monkeypatch, tmp_pa
 
 
 # ---------------------------------------------------------------------------
-# AH-6/AH-7 — Cap the results panel and scroll internally.
-# AH-6: "limit id=\"results-container\" to 1 window height and enable scroll
-# for the rest of the content". AH-7 refines the cap: "actually scrollable 0.5
-# of window height should be id=\"results-container\"" → max-height 50vh.
-# Served HTML must reference the cache-bumped stylesheet, and the served
-# stylesheet must constrain #results-container to 50vh with internal overflow
-# scrolling (AH-3 TestClient served-HTML pattern).
+# AH-6/AH-7/AH-8 — Results panel: 50vh cap, pinned header, only the
+# viewports scroll.
+# AH-6: cap + scroll. AH-7: cap = 50vh ("0.5 of window height").
+# AH-8: "only id=\"viewport-transcript\" should be scrollable, but currently
+# id=\"results-container\" is scrollabel and header ... is hidden when
+# scrolling" → container is a non-scrolling flex column (overflow: hidden),
+# #results-header pinned (flex: 0 0 auto), the three viewports own the scroll
+# (flex: 1 1 auto; min-height: 0; overflow-y: auto), and the segments list
+# drops its nested max-h-[500px] scroller (single scroll owner).
+# Served-asset TestClient pattern (AH-3), contracts refined in place.
 # ---------------------------------------------------------------------------
 
 
-def test_index_page_cache_busts_stylesheet_for_results_cap():
+def test_index_page_serves_pinned_header_contract():
     response = client.get("/")
     assert response.status_code == 200
-    assert "/static/style.css?v=5.2" in response.text, (
-        "index.html must bump the style.css cache-bust version when the results-cap rule changes"
+    assert "/static/style.css?v=5.3" in response.text, (
+        "index.html must bump the style.css cache-bust version when the scroll-ownership rules ship"
+    )
+    assert 'id="results-header"' in response.text, (
+        "the results header div needs a stable id hook so CSS can pin it"
+    )
+    segments = re.search(r'<div id="transcript-segments-list"[^>]*>', response.text)
+    assert segments, "the transcript segments list div must exist"
+    assert "max-h-[500px]" not in segments.group(0) and "overflow-y-auto" not in segments.group(0), (
+        "segments list must not own a nested scroller — the viewport is the single scroll owner"
     )
 
 
-def test_served_css_caps_results_container_to_half_viewport():
+def test_served_css_scrolls_only_the_viewports():
     response = client.get("/static/style.css")
     assert response.status_code == 200
-    rule = re.search(r"#results-container\s*\{([^}]*)\}", response.text)
-    assert rule, "style.css must contain a #results-container rule"
-    body = rule.group(1)
+    css = response.text
+
+    container = re.search(r"#results-container\s*\{([^}]*)\}", css)
+    assert container, "style.css must contain a #results-container rule"
+    body = container.group(1)
     assert re.search(r"max-height\s*:\s*50vh", body), (
-        "#results-container max-height must be 50vh (half the window height, per AH-7)"
+        "#results-container max-height must stay 50vh (AH-7 contract)"
     )
-    assert re.search(r"overflow-y\s*:\s*auto", body), (
-        "#results-container must scroll its overflow internally"
+    assert re.search(r"display\s*:\s*flex", body) and re.search(r"flex-direction\s*:\s*column", body), (
+        "#results-container must be a flex column so header and viewport sizes compose"
     )
+    assert re.search(r"overflow\s*:\s*hidden", body), (
+        "#results-container must clip, not scroll"
+    )
+    assert not re.search(r"overflow-y\s*:\s*auto", body), (
+        "#results-container must NOT scroll itself — only the viewports scroll (AH-8)"
+    )
+
+    header = re.search(r"#results-header\s*\{([^}]*)\}", css)
+    assert header, "style.css must contain a #results-header rule"
+    assert re.search(r"flex\s*:\s*0 0 auto", header.group(1)), (
+        "the results header must be pinned (no shrink, no grow)"
+    )
+
+    viewports = re.search(
+        r"#viewport-transcript[^{,]*(?:,[^{]*)*#viewport-polish[^{,]*(?:,[^{]*)*#viewport-summary[^{]*\{([^}]*)\}",
+        css,
+    )
+    assert viewports, "style.css must size/scroll the three result viewports"
+    vbody = viewports.group(1)
+    assert re.search(r"flex\s*:\s*1 1 auto", vbody), "viewports must fill the remaining height"
+    assert re.search(r"min-height\s*:\s*0", vbody), "flex children need min-height:0 to scroll"
+    assert re.search(r"overflow-y\s*:\s*auto", vbody), "the viewports own the scrolling"
