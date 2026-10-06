@@ -63,7 +63,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+class NoCacheStaticFiles(StaticFiles):
+    """AH-16c: force revalidation for static assets. Without Cache-Control, browsers fall back to
+    heuristic freshness and keep running a stale cached app.js (the AH-16/AH-16b renderer fixes
+    were invisible for exactly this reason). etag/last-modified still make revalidations cheap 304s.
+    (Starlette 1.7.0 StaticFiles has no headers= kwarg — the file_response hook is the supported seam.)"""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/static", NoCacheStaticFiles(directory=str(STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 audio_processor = AudioProcessor()
 

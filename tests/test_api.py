@@ -292,3 +292,33 @@ def test_served_css_scrolls_only_the_viewports():
     assert re.search(r"flex\s*:\s*1 1 auto", vbody), "viewports must fill the remaining height"
     assert re.search(r"min-height\s*:\s*0", vbody), "flex children need min-height:0 to scroll"
     assert re.search(r"overflow-y\s*:\s*auto", vbody), "the viewports own the scrolling"
+
+
+# ---------------------------------------------------------------------------
+# AH-16c: static asset delivery. The AH-16/AH-16b app.js fixes were invisible
+# to the user's browser: the template cache-buster (?v=5.0) was never bumped
+# across those changes and /static was served WITHOUT Cache-Control (browsers
+# fall back to heuristic freshness and keep running the old app.js).
+# Contract: the app.js reference must carry the current cache-bust version, and
+# /static responses must force revalidation (Cache-Control: no-cache — the
+# existing etag/last-modified still produce cheap 304s).
+# style.css keeps ?v=5.3: the asset has not changed since AH-8 bumped it.
+# ---------------------------------------------------------------------------
+
+
+def test_app_js_cache_buster_matches_shipped_asset():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "/static/app.js?v=5.1" in response.text, (
+        "index.html must bump the app.js cache-bust version whenever app.js changes "
+        "(AH-16/AH-16b shipped word-renderer fixes under the stale ?v=5.0)"
+    )
+
+
+def test_static_assets_served_with_revalidation():
+    response = client.get("/static/app.js")
+    assert response.status_code == 200
+    assert response.headers.get("cache-control") == "no-cache", (
+        "/static must send Cache-Control: no-cache so browsers revalidate instead of "
+        "trusting heuristic freshness (AH-16c: stale cached app.js hid shipped fixes)"
+    )
