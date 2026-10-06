@@ -27,6 +27,82 @@ MAX_PAYLOAD_BYTES = 24 * 1024 * 1024  # 24 MB
 CHUNK_DURATION_SECONDS = 1200  # 20 minutes for segmentation when file is very long
 
 
+def _is_word_continuation(token: str) -> bool:
+    """whisper tokenization convention: word-initial tokens carry a leading
+    space, continuations of the same word do not. A token that starts with a
+    letter and has no leading space continues the previous token's word."""
+    return bool(token) and not token[0].isspace() and token[0].isalpha()
+
+
+def _ends_with_word_char(token: str) -> bool:
+    return bool(token) and token[-1].isalpha()
+
+
+def _repair_mid_word_boundaries(segments: list[Segment]) -> None:
+    """AH-14 Option A: no segment boundary may split a word.
+
+    The engine (whisper.cpp) cuts segments at subword-token positions chosen
+    by the model's timestamp tokens — ~2.7% of boundaries in the reference
+    job cut a word in half ("мод|елей", "лок|ально", "агент|ство"). Detection
+    is token-level (the engine's word tokens are authoritative — never a text
+    heuristic): where the next segment's first token is a word continuation,
+    the trailing fragment tokens are moved across the boundary to the segment
+    where the word actually completes, and the boundary timestamps follow the
+    moved word. Text-concatenation invariant: no text is lost, added, or
+    reordered (whitespace may shift at a moved boundary — the fragment joins
+    its word). Segments without word tokens (400-fallback path) are left
+    untouched — there is no token evidence to act on.
+    """
+    i = 0
+    while i + 1 < len(segments):
+        cur, nxt = segments[i], segments[i + 1]
+        if (
+            not cur.words
+            or not nxt.words
+            or not _is_word_continuation(nxt.words[0].word)
+            or not _ends_with_word_char(cur.words[-1].word)
+        ):
+            i += 1
+            continue
+
+        # Collect the split word's fragment tokens at the tail of cur: walk
+        # back through continuation tokens to the word-initial token.
+        frag: list[Word] = []
+        while cur.words:
+            tok = cur.words.pop()
+            frag.insert(0, tok)
+            if tok.word[:1].isspace():
+                break  # word-initial token reached — fragment complete
+
+        frag_text = "".join(t.word for t in frag).strip()
+        cont_text = nxt.words[0].word.strip()
+        if (
+            not frag_text
+            or not cur.text.rstrip().endswith(frag_text)
+            or not nxt.text.startswith(cont_text)
+        ):
+            # Text and tokens disagree — restore the tokens, leave the
+            # boundary untouched (conservative; invariant preserved).
+            cur.words.extend(frag)
+            i += 1
+            continue
+
+        cur.text = cur.text.rstrip()[: -len(frag_text)].rstrip()
+        nxt.text = frag_text + nxt.text
+        nxt.words = frag + list(nxt.words)
+        # Timestamps follow the moved word: cur ends at its last complete
+        # word, nxt starts no later than the moved token.
+        if cur.words:
+            cur.end = cur.words[-1].end
+        nxt.start = min(nxt.start, frag[0].start)
+
+        if not cur.words:
+            # The word spanned the whole of cur — the segment is now empty.
+            segments.pop(i)
+            continue
+        i += 1
+
+
 class OpenAICompatibleTranscriber(BaseTranscriber):
     """Modular, configuration-driven audio transcriber for OpenAI-compatible REST APIs."""
 
@@ -217,6 +293,11 @@ class OpenAICompatibleTranscriber(BaseTranscriber):
                         if seg.start <= tw_start <= seg.end:
                             seg.words.append(word_obj)
                             break
+
+            # AH-14 Option A: repair mid-word boundaries after word tokens
+            # have been assigned (live SSE already streamed the engine's
+            # segments via on_segment above — the final result is repaired).
+            _repair_mid_word_boundaries(parsed_segments)
         else:
             # Fallback when provider returns text without segmented timestamps
             if raw_text.strip():

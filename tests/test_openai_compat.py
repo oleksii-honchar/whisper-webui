@@ -763,4 +763,273 @@ def test_transcription_request_uses_settings_timeout(tmp_path: Path):
         settings.stt_request_timeout = original
 
 
+# ---------------------------------------------------------------------------
+# AH-14 Option A — mid-word boundary repair in _parse_verbose_json.
+# The engine (whisper.cpp via llama-swap) cuts segments at subword-token
+# positions: word-initial tokens carry a leading space, continuations do not
+# (whisper tokenization convention). Real observed patterns reproduced here
+# from data-T10E2E-full-result.json (job 9a24a361): "мод|елей" @84.5s
+# (segments 25/26), "лок|ально" (29/30), "агент|ство" (112/113).
+# Rule: no segment boundary may split a word — the trailing fragment (its
+# word token) moves across the boundary to where the word completes.
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+
+def _squash(texts) -> str:
+    """All non-whitespace characters in order — the text-concatenation
+    invariant carrier: repair must never lose/add/reorder text; whitespace
+    may change at a moved boundary (the fragment joins its word)."""
+    return _re.sub(r"\s+", "", "".join(texts))
+
+
+def _ah14_real_excerpt_models_cut() -> dict:
+    """REAL excerpt — segments 25/26 of job 9a24a361 (word "моделей" split
+    at 84.5 s), structure copied verbatim from data-T10E2E-full-result.json."""
+    return {
+        "text": "А подскажи, ти вже целенаправленно выбирав нишу яичных моделей,",
+        "language": "ukrainian",
+        "duration": 85.0,
+        "segments": [
+            {
+                "id": 25, "start": 78.0, "end": 84.5,
+                "text": "А подскажи, ти вже целенаправленно выбирав нишу яичных мод",
+                "words": [
+                    {"word": " А", "start": 78.07, "end": 78.17},
+                    {"word": " под", "start": 78.17, "end": 78.72},
+                    {"word": "ск", "start": 78.72, "end": 79.08},
+                    {"word": "ажи", "start": 79.08, "end": 79.62},
+                    {"word": ",", "start": 79.85, "end": 80.0},
+                    {"word": " ти", "start": 80.0, "end": 80.22},
+                    {"word": " вже", "start": 80.22, "end": 80.46},
+                    {"word": " ц", "start": 80.6, "end": 80.67},
+                    {"word": "елен", "start": 80.67, "end": 81.09},
+                    {"word": "ап", "start": 81.33, "end": 81.34},
+                    {"word": "рав", "start": 81.34, "end": 81.68},
+                    {"word": "л", "start": 81.68, "end": 81.77},
+                    {"word": "енно", "start": 81.8, "end": 82.24},
+                    {"word": " выб", "start": 82.24, "end": 82.58},
+                    {"word": "ир", "start": 82.58, "end": 82.71},
+                    {"word": "ав", "start": 82.81, "end": 83.02},
+                    {"word": " н", "start": 83.02, "end": 83.13},
+                    {"word": "иш", "start": 83.13, "end": 83.35},
+                    {"word": "у", "start": 83.35, "end": 83.46},
+                    {"word": " я", "start": 83.46, "end": 83.57},
+                    {"word": "ич", "start": 83.57, "end": 83.79},
+                    {"word": "них", "start": 83.79, "end": 84.07},
+                    {"word": " мод", "start": 84.45, "end": 84.47},
+                ],
+            },
+            {
+                "id": 26, "start": 84.5, "end": 85.0,
+                "text": "елей,",
+                "words": [
+                    {"word": "елей", "start": 84.5, "end": 84.97},
+                    {"word": ",", "start": 85.0, "end": 85.0},
+                ],
+            },
+        ],
+    }
+
+
+def test_ah14_parse_repairs_real_mid_word_cut_models():
+    """"…нишу яичных мод" / "елей," → fragment "мод" moves across the
+    boundary; timestamps follow the moved word token."""
+    transcriber = _make_openai_transcriber()
+    data = _ah14_real_excerpt_models_cut()
+    before = _squash(s["text"] for s in data["segments"])
+
+    segs, _text, _lang, _dur = transcriber._parse_verbose_json(data)
+
+    assert len(segs) == 2, "repair must not add or drop segments"
+    assert segs[0].text == "А подскажи, ти вже целенаправленно выбирав нишу яичных"
+    assert segs[1].text == "моделей,"
+    # word tokens move with the text: " мод" joins its continuation "елей"
+    assert [w.word for w in segs[0].words][-1] == "них"
+    assert [w.word for w in segs[1].words][:2] == [" мод", "елей"]
+    # segment N ends at its last complete word; N+1 starts at the moved token
+    assert segs[0].end == 84.07
+    assert segs[1].start == 84.45
+    # INVARIANT: no text lost/added/reordered (whitespace may shift at the move)
+    assert _squash(s.text for s in segs) == before
+
+
+def test_ah14_repairs_multi_token_fragments_lok_alno_and_agentstvo():
+    """Words split across THREE tokens (" л"+"ок" | "ально",
+    " а"+"г"+"ент" | "ство") — the whole trailing fragment moves."""
+    transcriber = _make_openai_transcriber()
+    data = {
+        "text": "Я маю АІ, всілякі АІ локально. Я просто не розказував про себе, но у мене є команда, агентство точніше по продакшену.",
+        "language": "ukrainian",
+        "duration": 430.0,
+        "segments": [
+            {
+                "id": 0, "start": 94.0, "end": 102.38,
+                "text": "Я маю АІ, всілякі АІ лок",
+                "words": [
+                    {"word": " Я", "start": 94.0, "end": 94.3},
+                    {"word": " маю", "start": 94.3, "end": 95.0},
+                    {"word": " А", "start": 95.0, "end": 95.2},
+                    {"word": "І", "start": 95.2, "end": 95.5},
+                    {"word": ",", "start": 95.5, "end": 95.6},
+                    {"word": " всі", "start": 95.6, "end": 96.0},
+                    {"word": "ля", "start": 96.0, "end": 96.3},
+                    {"word": "кі", "start": 96.3, "end": 96.6},
+                    {"word": " А", "start": 96.6, "end": 96.8},
+                    {"word": "І", "start": 96.8, "end": 97.0},
+                    {"word": " л", "start": 101.55, "end": 101.72},
+                    {"word": "ок", "start": 101.72, "end": 101.78},
+                ],
+            },
+            {
+                "id": 1, "start": 102.38, "end": 103.0,
+                "text": "ально.",
+                "words": [
+                    {"word": "ально", "start": 102.38, "end": 103.0},
+                    {"word": ".", "start": 103.0, "end": 103.0},
+                ],
+            },
+            {
+                "id": 2, "start": 424.0, "end": 428.46,
+                "text": "Я просто не розказував про себе, но у мене є команда, агент",
+                "words": [
+                    {"word": " Я", "start": 424.07, "end": 424.07},
+                    {"word": " просто", "start": 424.07, "end": 424.49},
+                    {"word": " коман", "start": 427.04, "end": 427.7},
+                    {"word": "да", "start": 427.7, "end": 428.0},
+                    {"word": ",", "start": 428.0, "end": 428.13},
+                    {"word": " а", "start": 428.13, "end": 428.17},
+                    {"word": "г", "start": 428.21, "end": 428.25},
+                    {"word": "ент", "start": 428.25, "end": 428.4},
+                ],
+            },
+            {
+                "id": 3, "start": 428.46, "end": 430.0,
+                "text": "ство точніше по продакшену.",
+                "words": [
+                    {"word": "ство", "start": 428.46, "end": 428.7},
+                    {"word": " точ", "start": 428.7, "end": 428.9},
+                    {"word": "ні", "start": 428.9, "end": 429.03},
+                    {"word": "ше", "start": 429.03, "end": 429.16},
+                    {"word": " по", "start": 429.16, "end": 429.22},
+                    {"word": " прод", "start": 429.33, "end": 429.48},
+                    {"word": "ак", "start": 429.56, "end": 429.68},
+                    {"word": "ш", "start": 429.68, "end": 429.74},
+                    {"word": "ен", "start": 429.74, "end": 429.87},
+                    {"word": "у", "start": 429.87, "end": 429.98},
+                    {"word": ".", "start": 429.99, "end": 430.0},
+                ],
+            },
+        ],
+    }
+    before = _squash(s["text"] for s in data["segments"])
+
+    segs, _t, _l, _d = transcriber._parse_verbose_json(data)
+
+    assert len(segs) == 4
+    assert segs[0].text == "Я маю АІ, всілякі АІ"
+    assert segs[1].text == "локально."
+    assert [w.word for w in segs[1].words][:3] == [" л", "ок", "ально"]
+    assert segs[1].start == 101.55
+    assert segs[0].end == 97.0  # end of last complete word "І"
+    assert segs[2].text == "Я просто не розказував про себе, но у мене є команда,"
+    assert segs[3].text == "агентство точніше по продакшену."
+    assert [w.word for w in segs[3].words][:4] == [" а", "г", "ент", "ство"]
+    assert _squash(s.text for s in segs) == before
+
+
+def test_ah14_noop_on_clean_boundaries():
+    """Already-clean boundaries (every next-segment token is word-initial)
+    must be left completely untouched."""
+    transcriber = _make_openai_transcriber()
+    data = {
+        "text": "Hello world. Second segment here.",
+        "language": "english",
+        "duration": 6.0,
+        "segments": [
+            {
+                "id": 0, "start": 0.0, "end": 2.5, "text": "Hello world.",
+                "words": [
+                    {"word": "Hello", "start": 0.0, "end": 1.0},
+                    {"word": " world", "start": 1.1, "end": 2.0},
+                    {"word": ".", "start": 2.4, "end": 2.5},
+                ],
+            },
+            {
+                "id": 1, "start": 2.6, "end": 6.0, "text": "Second segment here.",
+                "words": [
+                    {"word": " Second", "start": 2.6, "end": 3.5},
+                    {"word": " segment", "start": 3.6, "end": 4.5},
+                    {"word": " here", "start": 4.6, "end": 5.5},
+                    {"word": ".", "start": 5.9, "end": 6.0},
+                ],
+            },
+        ],
+    }
+
+    segs, _t, _l, _d = transcriber._parse_verbose_json(data)
+
+    assert [s.text for s in segs] == ["Hello world.", "Second segment here."]
+    assert [(s.start, s.end) for s in segs] == [(0.0, 2.5), (2.6, 6.0)]
+    assert [len(s.words) for s in segs] == [3, 4]
+
+
+def test_ah14_noop_without_word_tokens():
+    """No word timestamps (400-fallback path) → no token evidence → no repair,
+    segments pass through unchanged."""
+    transcriber = _make_openai_transcriber()
+    data = {
+        "text": "перша частина друг",
+        "language": "ukrainian",
+        "duration": 4.0,
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 2.0, "text": "перша частина друг"},
+            {"id": 1, "start": 2.0, "end": 4.0, "text": "а частина"},
+        ],
+    }
+
+    segs, _t, _l, _d = transcriber._parse_verbose_json(data)
+
+    assert [s.text for s in segs] == ["перша частина друг", "а частина"]
+    assert [(s.start, s.end) for s in segs] == [(0.0, 2.0), (2.0, 4.0)]
+
+
+def test_ah14_punctuation_at_boundary_is_not_a_word_cut():
+    """A boundary after a complete word followed by punctuation must not move
+    anything: "моделей." | "І це" stays as-is."""
+    transcriber = _make_openai_transcriber()
+    data = {
+        "text": "реальних моделей. І це правда",
+        "language": "ukrainian",
+        "duration": 6.0,
+        "segments": [
+            {
+                "id": 0, "start": 0.0, "end": 3.0, "text": "реальних моделей.",
+                "words": [
+                    {"word": " реаль", "start": 0.0, "end": 1.0},
+                    {"word": "них", "start": 1.0, "end": 1.5},
+                    {"word": " модел", "start": 1.6, "end": 2.4},
+                    {"word": "ей", "start": 2.4, "end": 2.8},
+                    {"word": ".", "start": 2.9, "end": 3.0},
+                ],
+            },
+            {
+                "id": 1, "start": 3.1, "end": 6.0, "text": "І це правда",
+                "words": [
+                    {"word": " І", "start": 3.1, "end": 3.5},
+                    {"word": " це", "start": 3.6, "end": 4.0},
+                    {"word": " прав", "start": 4.1, "end": 5.5},
+                    {"word": "да", "start": 5.5, "end": 6.0},
+                ],
+            },
+        ],
+    }
+
+    segs, _t, _l, _d = transcriber._parse_verbose_json(data)
+
+    assert [s.text for s in segs] == ["реальних моделей.", "І це правда"]
+    assert [(s.start, s.end) for s in segs] == [(0.0, 3.0), (3.1, 6.0)]
+
+
 
