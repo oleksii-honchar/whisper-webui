@@ -1040,10 +1040,8 @@ document.addEventListener("DOMContentLoaded", () => {
     textSpan.className = "text-slate-200 leading-relaxed flex-1";
 
     if (seg.words && seg.words.length > 0) {
-      // AH-16: token-convention join via makeWordSpan — joined spans == seg.text exactly.
-      seg.words.forEach((w, wIdx) => {
-        textSpan.appendChild(makeWordSpan(w, wIdx === 0));
-      });
+      // AH-16b: word spans grouped by segment text — rendered text == seg.text exactly.
+      renderWordSpans(textSpan, seg);
     } else {
       textSpan.textContent = seg.text;
     }
@@ -1060,28 +1058,78 @@ document.addEventListener("DOMContentLoaded", () => {
     return `${String(mins).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   }
 
-  // AH-16: shared word-token span builder. Honors the engine token convention
-  // (word-initial tokens carry a leading space, continuations attach directly);
-  // the first token of a segment renders without its leading space because
-  // segment.text is stripped by the adapter — joined spans per segment ==
-  // segment.text exactly. Click-to-seek wiring unchanged.
-  function makeWordSpan(w, isFirst) {
-    const wSpan = document.createElement("span");
-    wSpan.className = "word-token py-0.5 rounded cursor-pointer transition-colors duration-150 hover:bg-indigo-500/30 hover:text-indigo-200";
-    wSpan.textContent = isFirst ? w.word.replace(/^\s+/, "") : w.word;
-    wSpan.dataset.start = w.start;
-    wSpan.dataset.end = w.end;
-    const confStr = w.probability !== null && w.probability !== undefined ? ` (${Math.round(w.probability * 100)}%)` : "";
-    wSpan.title = `${w.start.toFixed(2)}s - ${w.end.toFixed(2)}s${confStr}`;
-    wSpan.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const activeAudio = audioPreview.src ? audioPreview : recordPreview;
-      if (activeAudio) {
-        activeAudio.currentTime = w.start;
-        activeAudio.play();
+  // AH-16b: word grouping derived from the SEGMENT TEXT, not from token spaces.
+  // Engine word tokens are BPE fragments: the leading space marks the FIRST token
+  // of the segment, word-initial tokens carry no reliable leading space, and
+  // subword fragments are indistinguishable from word starts by spaces alone.
+  // Greedy match of the token sequence against segment.text: a space in the TEXT
+  // at the current position starts a new word; a token continues the current word
+  // when the text has no space there. Returns [{tokens, text}] or null when a
+  // token does not match the text position (caller falls back to a single plain
+  // span — never render broken text). Invariant: word texts joined with single
+  // spaces == segment.text exactly.
+  function groupWordsBySegmentText(seg) {
+    const text = seg.text || "";
+    let pos = 0;
+    const groups = [];
+    for (const w of seg.words) {
+      const content = (w.word || "").trim(); // spaces come from the TEXT, never from tokens
+      if (!content) continue; // whitespace-only token contributes nothing
+      let boundary = false;
+      if (pos > 0 && pos < text.length && text[pos] === " ") {
+        pos++; // word boundary derived from the text
+        boundary = true;
       }
+      if (!text.startsWith(content, pos)) return null;
+      if (groups.length === 0 || boundary) groups.push({ tokens: [w], text: content });
+      else {
+        const g = groups[groups.length - 1];
+        g.tokens.push(w);
+        g.text += content;
+      }
+      pos += content.length;
+    }
+    if (pos !== text.length || groups.length === 0) return null;
+    return groups;
+  }
+
+  // AH-16b: render one clickable span per WORD (not per BPE fragment). Words are
+  // separated by a single text-node space (same mechanism as the inter-segment
+  // separator below), so the rendered text equals segment.text exactly.
+  // Click-to-seek preserved: seeking uses the word's FIRST token start; the span
+  // covers the word's full time range (dataset.start/end) for the karaoke sync.
+  // Fallback: tokens do not match the text position -> render segment.text as one
+  // non-clickable span (never broken text).
+  function renderWordSpans(container, seg) {
+    const groups = groupWordsBySegmentText(seg);
+    if (!groups) {
+      const plain = document.createElement("span");
+      plain.textContent = seg.text;
+      container.appendChild(plain);
+      return;
+    }
+    groups.forEach((g, i) => {
+      if (i > 0) container.appendChild(document.createTextNode(" "));
+      const first = g.tokens[0];
+      const last = g.tokens[g.tokens.length - 1];
+      const wSpan = document.createElement("span");
+      wSpan.className = "word-token py-0.5 rounded cursor-pointer transition-colors duration-150 hover:bg-indigo-500/30 hover:text-indigo-200";
+      wSpan.textContent = g.text;
+      wSpan.dataset.start = first.start;
+      wSpan.dataset.end = last.end;
+      const confs = g.tokens.map((t) => t.probability).filter((p) => p !== null && p !== undefined);
+      const confStr = confs.length ? ` (${Math.round((confs.reduce((a, b) => a + b, 0) / confs.length) * 100)}%)` : "";
+      wSpan.title = `${first.start.toFixed(2)}s - ${last.end.toFixed(2)}s${confStr}`;
+      wSpan.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const activeAudio = audioPreview.src ? audioPreview : recordPreview;
+        if (activeAudio) {
+          activeAudio.currentTime = first.start;
+          activeAudio.play();
+        }
+      });
+      container.appendChild(wSpan);
     });
-    return wSpan;
   }
 
   function renderSpeakerDialogue(result) {
@@ -1143,10 +1191,10 @@ document.addEventListener("DOMContentLoaded", () => {
         card.appendChild(header);
 
         // Turn words & segments
-        // AH-16: render word tokens as inline text honoring the engine token
-        // convention (word-initial tokens carry a leading space, continuations
-        // attach directly). No flex-gap/padding between tokens — joined spans
-        // reproduce each segment's text exactly.
+        // AH-16b: render one span per WORD, grouping derived from each segment's
+        // text (token spaces are not a reliable word-boundary signal). Words are
+        // separated by single text-node spaces — rendered text reproduces each
+        // segment's text exactly.
         const textContainer = document.createElement("div");
         textContainer.className = "text-sm text-slate-200 leading-relaxed pt-1";
 
@@ -1164,10 +1212,8 @@ document.addEventListener("DOMContentLoaded", () => {
             }
           }
           if (hasWords) {
-            // AH-16: token-convention join via makeWordSpan — joined spans == seg.text exactly.
-            seg.words.forEach((w, wIdx) => {
-              textContainer.appendChild(makeWordSpan(w, wIdx === 0));
-            });
+            // AH-16b: word spans grouped by segment text — rendered text == seg.text exactly.
+            renderWordSpans(textContainer, seg);
           } else {
             const segSpan = document.createElement("span");
             segSpan.textContent = seg.text + " ";
