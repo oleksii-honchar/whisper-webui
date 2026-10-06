@@ -256,6 +256,73 @@ async def test_run_pipeline_logs_per_stage_durations(caplog, tmp_path: Path, mon
     assert any("completed in" in m for m in msgs), "total-duration log"
 
 
+# --- AH-13: job-start names the diarization engine + availability (P5 ext.) --
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("engine", "available"),
+    [("remote", True), ("remote", False), ("sherpa-onnx", True), ("sherpa-onnx", False)],
+)
+async def test_job_start_log_names_diarization_engine_and_availability(
+    caplog, tmp_path: Path, monkeypatch, engine: str, available: bool
+):
+    """AH-13: the job-start INFO record must carry the resolved diarization engine
+    and its availability — the wrong-engine path was invisible in logs
+    (evidence-T10E2E-env.txt: job-start named only the STT engine)."""
+    caplog.set_level(logging.INFO, logger="jobs")
+    import config as config_module
+
+    monkeypatch.setattr(config_module.settings, "diarization_engine", engine)
+
+    diarizer = MagicMock()
+    diarizer.is_available.return_value = available
+    diarizer.models_ready.return_value = True
+
+    manager = JobManager()
+    job = manager.create_job("engine.wav")
+    await _run_pipeline_with_fakes(
+        manager, job.job_id, _tmp_media(tmp_path), diarizer=diarizer, enable_diarization=True
+    )
+    assert job.status == "completed", f"pipeline must complete; got {job.status}: {job.error}"
+
+    start_msgs = [
+        r.getMessage() for r in caplog.records if r.name == "jobs" and "started" in r.getMessage()
+    ]
+    assert start_msgs, "expected a job-start INFO record"
+    assert any(
+        f"diarization_engine={engine}" in m and f"available={available}" in m for m in start_msgs
+    ), f"job-start record must name diarization_engine={engine} available={available}; got: {start_msgs}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["remote", "sherpa-onnx"])
+async def test_skip_warning_names_the_unavailable_diarization_engine(
+    caplog, tmp_path: Path, monkeypatch, engine: str
+):
+    """AH-13: the 'engine not available, skipping' warning must name the engine it skipped."""
+    caplog.set_level(logging.INFO, logger="jobs")
+    import config as config_module
+
+    monkeypatch.setattr(config_module.settings, "diarization_engine", engine)
+
+    diarizer = MagicMock()
+    diarizer.is_available.return_value = False
+
+    manager = JobManager()
+    job = manager.create_job("skipped.wav")
+    await _run_pipeline_with_fakes(
+        manager, job.job_id, _tmp_media(tmp_path), diarizer=diarizer, enable_diarization=True
+    )
+    assert job.status == "completed", f"pipeline must complete; got {job.status}: {job.error}"
+
+    warnings = [
+        r.getMessage() for r in caplog.records if r.name == "jobs" and r.levelno == logging.WARNING
+    ]
+    assert any("skipping" in m and engine in m for m in warnings), (
+        f"skip warning must name the skipped engine {engine!r}; got: {warnings}"
+    )
+
+
 # --- P9: diarization heartbeat + start/end logs -----------------------------
 
 @pytest.mark.asyncio

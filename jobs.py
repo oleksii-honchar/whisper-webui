@@ -196,13 +196,37 @@ class JobManager:
         audio_processor = AudioProcessor()
         converted_wav: Path | None = None
 
+        # AH-13: resolve the diarization engine at job start so the job-start INFO
+        # line names it — the wrong-engine path was invisible in logs
+        # (evidence-T10E2E-env.txt: only the STT engine was named). is_available()
+        # is a config check; the resolved instance is reused below (no re-resolve).
+        diarizer = None
+        diarization_available = False
+        if enable_diarization:
+            try:
+                from diarization import diarizer_factory
+                diarizer = diarizer_factory.get_diarizer(settings.diarization_engine)
+                diarization_available = diarizer.is_available()
+            except Exception as diar_init_err:
+                logger.warning(
+                    "Diarization engine %s could not be initialized: %s",
+                    settings.diarization_engine, diar_init_err,
+                )
+
         try:
             # Queue waits become visible: the Job already models "queued" — emit it
             # BEFORE acquiring the semaphore so saturated queues are observable (P6).
             self.update_status(job_id, "queued", 5, "Waiting in queue...")
+            # AH-13 (P5 extension): one INFO line at job start, now also carrying
+            # the resolved diarization engine + availability.
+            diarization_note = (
+                f" diarization_engine={settings.diarization_engine} available={diarization_available}"
+                if enable_diarization
+                else ""
+            )
             logger.info(
-                "Job %s started: engine=%s model=%s language=%s",
-                job_id, whisper_engine, whisper_model, language or "auto",
+                "Job %s started: engine=%s model=%s language=%s%s",
+                job_id, whisper_engine, whisper_model, language or "auto", diarization_note,
             )
 
             async with self.semaphore:
@@ -278,11 +302,12 @@ class JobManager:
                 num_speakers_detected = 0
                 if enable_diarization:
                     try:
-                        from diarization import diarizer_factory, align_speakers_to_segments
+                        from diarization import align_speakers_to_segments
                         # R4 (DEC-14): engine resolved from settings — rollback is
-                        # one env var (DIARIZATION_ENGINE=sherpa-onnx).
-                        diarizer = diarizer_factory.get_diarizer(settings.diarization_engine)
-                        if diarizer.is_available():
+                        # one env var (DIARIZATION_ENGINE=sherpa-onnx). AH-13: the
+                        # diarizer was already resolved at job start (same
+                        # settings.diarization_engine); reuse it — no re-resolve.
+                        if diarizer is not None and diarization_available:
                             if hasattr(diarizer, "models_ready") and not diarizer.models_ready():
                                 self.update_status(job_id, "diarizing", 52, "Downloading speaker diarization models on demand (first run only)...")
                                 # Model download stays in the parent (thread pool —
@@ -342,7 +367,11 @@ class JobManager:
                                 "intervals": [i.model_dump() for i in diar_result.intervals],
                             })
                         else:
-                            logger.warning("Speaker diarization requested but engine or models are not available; skipping.")
+                            # AH-13: the skip warning names the engine it skipped.
+                            logger.warning(
+                                "Speaker diarization requested but engine %s is not available; skipping.",
+                                settings.diarization_engine,
+                            )
                     except Exception as diar_err:
                         logger.warning("Diarization failed for job %s: %s", job_id, diar_err)
 
