@@ -348,9 +348,13 @@
       </div>
 
       <!-- Result Viewports -->
-      <div id="viewport-transcript" class="space-y-4">
-        <!-- Timestamped Segments Switch -->
-        <div class="flex items-center justify-between text-xs text-slate-400">
+      <!-- AH-16: the transcript viewport no longer scrolls as a whole; the controls
+           row is pinned (sticky top, opaque dark background) and the two content
+           containers below are the only scroll areas (bounded by the existing
+           #results-container 50vh flex chain in style.css). -->
+      <div id="viewport-transcript" class="space-y-4 flex flex-col !overflow-hidden">
+        <!-- Timestamped Segments Switch — AH-16: pinned controls row -->
+        <div class="flex items-center justify-between text-xs text-slate-400 sticky top-0 z-10 bg-slate-900 flex-shrink-0">
           <span id="transcription-stats">Duration: 0.0s • Processed in: 0.0s</span>
           <div class="flex items-center space-x-4">
             <span class="text-[11px] text-indigo-400/80 hidden sm:inline flex items-center gap-1">
@@ -362,8 +366,8 @@
             </label>
           </div>
         </div>
-        <div id="transcript-segments-list" class="space-y-2 pr-2 custom-scrollbar"></div>
-        <div id="transcript-plain-text" class="hidden text-sm text-slate-200 leading-relaxed whitespace-pre-wrap"></div>
+        <div id="transcript-segments-list" class="space-y-2 pr-2 custom-scrollbar flex-1 min-h-0 overflow-y-auto"></div>
+        <div id="transcript-plain-text" class="hidden text-sm text-slate-200 leading-relaxed whitespace-pre-wrap custom-scrollbar flex-1 min-h-0 overflow-y-auto"></div>
       </div>
 
       <div id="viewport-polish" class="hidden space-y-3">

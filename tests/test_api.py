@@ -214,6 +214,12 @@ def test_sync_transcribe_diarization_uses_settings_threshold(monkeypatch, tmp_pa
 # #results-header pinned (flex: 0 0 auto), the three viewports own the scroll
 # (flex: 1 1 auto; min-height: 0; overflow-y: auto), and the segments list
 # drops its nested max-h-[500px] scroller (single scroll owner).
+# AH-16 refines the transcript viewport again: controls row pinned (sticky
+# top-0, opaque bg), and scroll ownership moves INTO the two content
+# containers (#transcript-segments-list / #transcript-plain-text own their
+# scrollers; the viewport itself is !overflow-hidden). style.css keeps the
+# viewport rules for the other viewports; the transcript overrides via
+# Tailwind important modifier.
 # Served-asset TestClient pattern (AH-3), contracts refined in place.
 # ---------------------------------------------------------------------------
 
@@ -229,8 +235,24 @@ def test_index_page_serves_pinned_header_contract():
     )
     segments = re.search(r'<div id="transcript-segments-list"[^>]*>', response.text)
     assert segments, "the transcript segments list div must exist"
-    assert "max-h-[500px]" not in segments.group(0) and "overflow-y-auto" not in segments.group(0), (
-        "segments list must not own a nested scroller — the viewport is the single scroll owner"
+    assert "max-h-[500px]" not in segments.group(0), (
+        "segments list must not use the legacy fixed-height scroller"
+    )
+    # AH-16: scroll ownership moved from the viewport to the content containers —
+    # the controls row is pinned and the two containers are the only scroll areas.
+    assert "overflow-y-auto" in segments.group(0) and "custom-scrollbar" in segments.group(0), (
+        "segments list must own its scroller (AH-16: containers are the scroll owners)"
+    )
+    viewport = re.search(r'<div id="viewport-transcript"[^>]*>', response.text)
+    assert viewport and "!overflow-hidden" in viewport.group(0), (
+        "the transcript viewport must not scroll as a whole (AH-16)"
+    )
+    assert re.search(r'class="[^"]*sticky top-0[^"]*bg-slate-900[^"]*"', response.text), (
+        "the transcript controls row must be pinned with an opaque background (AH-16)"
+    )
+    plain = re.search(r'<div id="transcript-plain-text"[^>]*>', response.text)
+    assert plain and "overflow-y-auto" in plain.group(0) and "custom-scrollbar" in plain.group(0), (
+        "the plain-text container must own its scroller (AH-16)"
     )
 
 

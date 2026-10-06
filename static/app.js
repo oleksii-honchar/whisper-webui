@@ -1037,26 +1037,12 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     const textSpan = document.createElement("span");
-    textSpan.className = "text-slate-200 leading-relaxed flex-1 flex flex-wrap gap-x-1 gap-y-0.5";
+    textSpan.className = "text-slate-200 leading-relaxed flex-1";
 
     if (seg.words && seg.words.length > 0) {
-      seg.words.forEach((w) => {
-        const wSpan = document.createElement("span");
-        wSpan.className = "word-token px-1 py-0.5 rounded cursor-pointer transition-colors duration-150 hover:bg-indigo-500/30 hover:text-indigo-200";
-        wSpan.textContent = w.word;
-        wSpan.dataset.start = w.start;
-        wSpan.dataset.end = w.end;
-        const confStr = w.probability !== null && w.probability !== undefined ? ` (${Math.round(w.probability * 100)}%)` : "";
-        wSpan.title = `${w.start.toFixed(2)}s - ${w.end.toFixed(2)}s${confStr}`;
-        wSpan.addEventListener("click", (e) => {
-          e.stopPropagation();
-          const activeAudio = audioPreview.src ? audioPreview : recordPreview;
-          if (activeAudio) {
-            activeAudio.currentTime = w.start;
-            activeAudio.play();
-          }
-        });
-        textSpan.appendChild(wSpan);
+      // AH-16: token-convention join via makeWordSpan — joined spans == seg.text exactly.
+      seg.words.forEach((w, wIdx) => {
+        textSpan.appendChild(makeWordSpan(w, wIdx === 0));
       });
     } else {
       textSpan.textContent = seg.text;
@@ -1072,6 +1058,30 @@ document.addEventListener("DOMContentLoaded", () => {
     const mins = Math.floor(secs / 60);
     const s = Math.floor(secs % 60);
     return `${String(mins).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+
+  // AH-16: shared word-token span builder. Honors the engine token convention
+  // (word-initial tokens carry a leading space, continuations attach directly);
+  // the first token of a segment renders without its leading space because
+  // segment.text is stripped by the adapter — joined spans per segment ==
+  // segment.text exactly. Click-to-seek wiring unchanged.
+  function makeWordSpan(w, isFirst) {
+    const wSpan = document.createElement("span");
+    wSpan.className = "word-token py-0.5 rounded cursor-pointer transition-colors duration-150 hover:bg-indigo-500/30 hover:text-indigo-200";
+    wSpan.textContent = isFirst ? w.word.replace(/^\s+/, "") : w.word;
+    wSpan.dataset.start = w.start;
+    wSpan.dataset.end = w.end;
+    const confStr = w.probability !== null && w.probability !== undefined ? ` (${Math.round(w.probability * 100)}%)` : "";
+    wSpan.title = `${w.start.toFixed(2)}s - ${w.end.toFixed(2)}s${confStr}`;
+    wSpan.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const activeAudio = audioPreview.src ? audioPreview : recordPreview;
+      if (activeAudio) {
+        activeAudio.currentTime = w.start;
+        activeAudio.play();
+      }
+    });
+    return wSpan;
   }
 
   function renderSpeakerDialogue(result) {
@@ -1133,28 +1143,30 @@ document.addEventListener("DOMContentLoaded", () => {
         card.appendChild(header);
 
         // Turn words & segments
+        // AH-16: render word tokens as inline text honoring the engine token
+        // convention (word-initial tokens carry a leading space, continuations
+        // attach directly). No flex-gap/padding between tokens — joined spans
+        // reproduce each segment's text exactly.
         const textContainer = document.createElement("div");
-        textContainer.className = "text-sm text-slate-200 leading-relaxed flex flex-wrap gap-x-1 gap-y-0.5 pt-1";
+        textContainer.className = "text-sm text-slate-200 leading-relaxed pt-1";
 
-        turn.segments.forEach((seg) => {
-          if (seg.words && seg.words.length > 0) {
-            seg.words.forEach((w) => {
-              const wSpan = document.createElement("span");
-              wSpan.className = "word-token px-1 py-0.5 rounded cursor-pointer transition-colors duration-150 hover:bg-indigo-500/30 hover:text-indigo-200";
-              wSpan.textContent = w.word;
-              wSpan.dataset.start = w.start;
-              wSpan.dataset.end = w.end;
-              const confStr = w.probability !== null && w.probability !== undefined ? ` (${Math.round(w.probability * 100)}%)` : "";
-              wSpan.title = `${w.start.toFixed(2)}s - ${w.end.toFixed(2)}s${confStr}`;
-              wSpan.addEventListener("click", (e) => {
-                e.stopPropagation();
-                const activeAudio = audioPreview.src ? audioPreview : recordPreview;
-                if (activeAudio) {
-                  activeAudio.currentTime = w.start;
-                  activeAudio.play();
-                }
-              });
-              textContainer.appendChild(wSpan);
+        turn.segments.forEach((seg, segIdx) => {
+          const hasWords = seg.words && seg.words.length > 0;
+          // AH-16: separate consecutive segments inside a turn only when the next
+          // segment starts a new word (its first token carries a leading space);
+          // mid-word continuations must glue to the previous segment.
+          if (segIdx > 0) {
+            const prev = turn.segments[segIdx - 1];
+            const prevHadWords = prev.words && prev.words.length > 0;
+            const startsNewWord = hasWords ? /^\s/.test(seg.words[0].word) : true;
+            if (startsNewWord && prevHadWords) {
+              textContainer.appendChild(document.createTextNode(" "));
+            }
+          }
+          if (hasWords) {
+            // AH-16: token-convention join via makeWordSpan — joined spans == seg.text exactly.
+            seg.words.forEach((w, wIdx) => {
+              textContainer.appendChild(makeWordSpan(w, wIdx === 0));
             });
           } else {
             const segSpan = document.createElement("span");
