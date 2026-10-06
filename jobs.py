@@ -11,7 +11,6 @@ import contextlib
 import logging
 import time
 import uuid
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,8 +24,9 @@ from llm import llm_registry, get_polish_prompt, ChunkedSummarizer
 
 logger = logging.getLogger(__name__)
 
-# Heartbeat interval for the diarization phase (no sub-progress available from
-# sherpa's blocking process() — report elapsed seconds instead, never fake %).
+# Heartbeat interval for the diarization phase (the remote engine exposes no
+# sub-progress — report elapsed seconds instead, never fake %). Engine-agnostic
+# elapsed reporting; still covers the remote cold-start window (AH-18 keeps it).
 DIARIZATION_HEARTBEAT_SECONDS = 30.0
 
 # AH-14 Option B: utterance merge parameters (readability rule confirmed by
@@ -77,22 +77,6 @@ def merge_segments_into_utterances(segments: list[Segment]) -> list[Segment]:
     for idx, m in enumerate(merged):
         m.id = idx
     return merged
-
-
-def _diarize_worker(audio: Any, num_speakers: int, cluster_threshold: float, engine: str):
-    """Process-pool worker for the diarization phase (P13, DEC-9; R4/DEC-14).
-
-    Module-level so ProcessPoolExecutor can pickle it by reference into the
-    child; the diarizer is constructed IN-CHILD from the ENGINE NAME passed by
-    run_pipeline (resolved from settings there — never a hardcoded constant)
-    and the blocking sherpa process() runs there — off the event loop's GIL,
-    so the UI/SSE feed stays responsive while diarization runs. Model download
-    stays in the parent (run_pipeline calls ensure_models before submitting).
-    """
-    from diarization import diarizer_factory
-
-    diarizer = diarizer_factory.get_diarizer(engine)
-    return diarizer.diarize(audio, num_speakers=num_speakers, cluster_threshold=cluster_threshold)
 
 
 @dataclass
@@ -207,9 +191,9 @@ class JobManager:
         self.emit(job_id, "status", {"status": status, "progress": progress, "message": message})
 
     async def _diarization_heartbeat(self, job_id: str) -> None:
-        """Re-emit the diarizing status with elapsed seconds while the blocking
-        sherpa process() is pending. No fake percentages — sherpa exposes no
-        sub-progress; elapsed time is the only honest signal."""
+        """Re-emit the diarizing status with elapsed seconds while the
+        diarization call is pending. No fake percentages — the engine exposes
+        no sub-progress; elapsed time is the only honest signal."""
         started = time.monotonic()
         while True:
             await asyncio.sleep(DIARIZATION_HEARTBEAT_SECONDS)
@@ -226,7 +210,7 @@ class JobManager:
         vad_filter: bool = True,
         enable_diarization: bool = False,
         num_speakers: int = -1,
-        cluster_threshold: float | None = None,
+        cluster_threshold: float = 0.5,
         ai_action: str = "summary",  # raw, polish, summary
         summary_level: str = "bullets",
         llm_provider: str = "ollama",
@@ -237,11 +221,11 @@ class JobManager:
         if not job:
             return
 
-        # The clustering threshold's default is settings.diarization_threshold —
-        # the setting is live end-to-end, no hardcoded constant (P14, DEC-10).
+        # AH-18 (DEC-17/18): the cluster_threshold default is the BaseDiarizer
+        # contract constant 0.5 — the settings indirection was removed with the
+        # engine. The parameter stays accepted (API unchanged), the only engine
+        # treats it as accepted-and-ignored (DEC-14).
         from config import settings
-        if cluster_threshold is None:
-            cluster_threshold = settings.diarization_threshold
 
         start_time = time.time()
         audio_processor = AudioProcessor()
@@ -354,50 +338,24 @@ class JobManager:
                 if enable_diarization:
                     try:
                         from diarization import align_speakers_to_segments
-                        # R4 (DEC-14): engine resolved from settings — rollback is
-                        # one env var (DIARIZATION_ENGINE=sherpa-onnx). AH-13: the
-                        # diarizer was already resolved at job start (same
-                        # settings.diarization_engine); reuse it — no re-resolve.
+                        # AH-13: the diarizer was already resolved at job start
+                        # (same settings.diarization_engine); reuse it — no
+                        # re-resolve. AH-18 (DEC-18): single executor path —
+                        # the diarize() call runs in the default thread
+                        # executor, same pattern as transcribe above.
                         if diarizer is not None and diarization_available:
-                            if hasattr(diarizer, "models_ready") and not diarizer.models_ready():
-                                self.update_status(job_id, "diarizing", 52, "Downloading speaker diarization models on demand (first run only)...")
-                                # Model download stays in the parent (thread pool —
-                                # network I/O): the process-pool child must never
-                                # re-download (P13).
-                                await loop.run_in_executor(None, diarizer.ensure_models)
-                            else:
-                                self.update_status(job_id, "diarizing", 60, "Identifying speakers (diarization)...")
+                            self.update_status(job_id, "diarizing", 60, "Identifying speakers (diarization)...")
                             heartbeat_task = asyncio.create_task(self._diarization_heartbeat(job_id))
                             diarize_start = time.time()
                             try:
-                                if diarizer.use_process_pool:
-                                    # P13 (DEC-9): the blocking sherpa process() runs in a
-                                    # child process — the GIL no longer freezes the UI/SSE
-                                    # feed while diarization runs. Heartbeat keeps covering
-                                    # the pool await (try/finally preserved from T6).
-                                    with ProcessPoolExecutor(max_workers=1) as pool:
-                                        diar_result = await loop.run_in_executor(
-                                            pool,
-                                            _diarize_worker,
-                                            audio_input,
-                                            num_speakers,
-                                            cluster_threshold,
-                                            settings.diarization_engine,
-                                        )
-                                else:
-                                    # R4 (DEC-14): HTTP-backed engines (use_process_pool
-                                    # False) run in the thread executor — same pattern as
-                                    # transcribe above. An HTTP call has no GIL problem,
-                                    # and ~183 MB audio samples are never pickled into a
-                                    # child process.
-                                    diar_result = await loop.run_in_executor(
-                                        None,
-                                        lambda: diarizer.diarize(
-                                            audio_input,
-                                            num_speakers=num_speakers,
-                                            cluster_threshold=cluster_threshold,
-                                        ),
-                                    )
+                                diar_result = await loop.run_in_executor(
+                                    None,
+                                    lambda: diarizer.diarize(
+                                        audio_input,
+                                        num_speakers=num_speakers,
+                                        cluster_threshold=cluster_threshold,
+                                    ),
+                                )
                             finally:
                                 heartbeat_task.cancel()
                                 with contextlib.suppress(asyncio.CancelledError):

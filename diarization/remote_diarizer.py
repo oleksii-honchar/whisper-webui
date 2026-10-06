@@ -4,7 +4,7 @@ AH-11b (DEC-14): talks to the Nemotron-3 sidecar (directly or through the
 llama-swap /upstream passthrough) at {DIARIZATION_API_URL}/diarize. The
 sidecar stays raw/faithful to model output; the de-blip policy (DEC-15, R2')
 lives HERE, on the integration side, so it applies regardless of who serves
-/diarize and never touches the sherpa path.
+/diarize. AH-18 (DEC-16) made this the only diarization engine.
 """
 
 from __future__ import annotations
@@ -33,20 +33,19 @@ class RemoteDiarizer(BaseDiarizer):
 
     ``num_speakers`` and ``cluster_threshold`` are ACCEPTED AND IGNORED: the
     upstream model is end-to-end (no clustering stage, arrival-ordered ≤8
-    speakers) — these sherpa-path parameters have no meaning here (DEC-14).
+    speakers) — these clustering-era parameters have no meaning here (DEC-14,
+    kept for API compatibility — DEC-17).
 
     ``is_available()`` is deliberately config-presence only — NO health probe:
     a probe through llama-swap's /upstream would trigger a model load on
     every check.
 
-    ``use_process_pool = False`` (R3): an HTTP call has no GIL problem and
-    must not pickle ~183 MB audio samples into a child process — the thread
-    executor path in run_pipeline is used instead.
+    run_pipeline runs the diarize() call in the default thread executor
+    (AH-18/DEC-18: the single executor path — an HTTP call has no GIL problem).
     """
 
     name: str = "remote"
     display_name: str = "Remote Diarizer (HTTP)"
-    use_process_pool: bool = False
 
     def __init__(self, transport: httpx.BaseTransport | None = None):
         # Test seam: unit tests inject httpx.MockTransport (no live sidecar).

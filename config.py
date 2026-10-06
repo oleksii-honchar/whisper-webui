@@ -185,28 +185,15 @@ class Settings(BaseModel):
         default_factory=lambda: _webhook_cfg.get("secret") or os.getenv("WEBHOOK_SECRET")
     )
 
-    # Speaker Diarization Settings (Sherpa-ONNX)
+    # Speaker Diarization Settings (remote engine — AH-18/DEC-17 removed the
+    # local-engine-only knobs: seg_model/emb_model/threshold/num_threads/provider)
     diarization_enabled: bool = Field(
         default_factory=lambda: bool(_diarization_cfg.get("enabled", True)) or os.getenv("DIARIZATION_ENABLED", "true").lower() in ("1", "true", "yes")
     )
-    diarization_seg_model: str = Field(
-        default_factory=lambda: _diarization_cfg.get("seg_model") or os.getenv("DIARIZATION_SEG_MODEL", "sherpa-onnx-pyannote-segmentation-3-0/model.onnx")
-    )
-    diarization_emb_model: str = Field(
-        default_factory=lambda: _diarization_cfg.get("emb_model") or os.getenv("DIARIZATION_EMB_MODEL", "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx")
-    )
-    diarization_threshold: float = Field(
-        default_factory=lambda: float(_diarization_cfg.get("threshold", 0.75) if _diarization_cfg.get("threshold") is not None else os.getenv("DIARIZATION_THRESHOLD", "0.75"))
-    )
-    diarization_num_threads: int = Field(
-        default_factory=lambda: int(_diarization_cfg.get("num_threads") or os.getenv("DIARIZATION_NUM_THREADS", str(min(8, os.cpu_count() or 1))))
-    )
-    diarization_provider: str = Field(
-        default_factory=lambda: _diarization_cfg.get("provider") or os.getenv("DIARIZATION_PROVIDER", "cpu")
-    )
-    # AH-11b (R1, DEC-14): engine switch — sherpa-onnx stays the rollback-safe default.
+    # AH-11b (R1) + AH-18 (DEC-17): engine switch stays as the extension
+    # surface; `remote` is now the single engine and the code default.
     diarization_engine: str = Field(
-        default_factory=lambda: _diarization_cfg.get("engine") or os.getenv("DIARIZATION_ENGINE", "sherpa-onnx")
+        default_factory=lambda: _diarization_cfg.get("engine") or os.getenv("DIARIZATION_ENGINE", "remote")
     )
     diarization_api_url: str = Field(
         default_factory=lambda: _diarization_cfg.get("api_url") or os.getenv("DIARIZATION_API_URL", "")

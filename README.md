@@ -1,6 +1,6 @@
 # Audio Transcriber
 
-Audio and video transcription tool powered by Whisper, ONNX speaker diarization, and optional LLM post-processing. Converts media to 16kHz mono WAV via FFmpeg, transcribes using local or API Whisper engines, and optionally polishes or summarizes transcripts using local or cloud LLMs.
+Audio and video transcription tool powered by Whisper, remote speaker diarization, and optional LLM post-processing. Converts media to 16kHz mono WAV via FFmpeg, transcribes using local or API Whisper engines, and optionally polishes or summarizes transcripts using local or cloud LLMs.
 
 <p align="center">
   <img src="docs/screenshots/dashboard.png" alt="Audio Transcriber Dashboard" width="100%">
@@ -16,9 +16,9 @@ Audio and video transcription tool powered by Whisper, ONNX speaker diarization,
   - `whisper.cpp` standalone C++ binary runner with SHA256 verification and compilation fallback.
   - Cloud STT via OpenAI-compatible endpoints (Groq Whisper, OpenRouter).
   - Subtitle and transcript export: plain text, timestamped segments, **SRT**, **WebVTT**, **ASS**, **JSON**.
-- **Speaker Diarization (ONNX)**:
-  - Offline speaker identification and turn segmentation using `sherpa-onnx` (Pyannote 3.0 segmentation + 3D-Speaker embedding models on CPU).
-  - On-demand model download on first use.
+- **Speaker Diarization (remote engine)**:
+  - Speaker identification and turn segmentation via an HTTP `/diarize` sidecar (e.g. NVIDIA Nemotron-3 Diarization hosted by llama-swap), configured with `DIARIZATION_API_URL`.
+  - No local diarization models — the engine is a thin HTTP client with a client-side de-blip filter (`DIARIZATION_MIN_SPEAKER_DURATION`).
   - Inline speaker renaming that updates exports and dialogue turns.
 - **Live Dictation (WebSockets)**:
   - Real-time microphone audio streaming over WebSockets (`/api/ws/transcribe`).
@@ -117,9 +117,9 @@ transcriber/
 ├── main.py                    # FastAPI server & Server-Sent Events (SSE) streaming
 ├── install.sh                 # Architecture-aware installer with SHA256 validation
 ├── run.sh                     # Application runner
-├── diarization/               # Lightweight Offline Diarization Subsystem (Sherpa-ONNX)
+├── diarization/               # Diarization Subsystem (remote HTTP engine)
 │   ├── base.py                # BaseDiarizer, SpeakerInterval & DiarizationResult DTOs
-│   ├── sherpa_diarizer.py     # Pyannote 3.0 + 3D-Speaker ONNX runner (on-demand download)
+│   ├── remote_diarizer.py     # HTTP /diarize client + de-blip filter (the only engine)
 │   ├── alignment.py           # Temporal overlap alignment mapping speakers to segments/words
 │   └── factory.py             # Diarizer dynamic factory and engine registry
 ├── notifications/             # Modular Notification System (Open/Closed Principle)

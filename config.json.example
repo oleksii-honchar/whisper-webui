@@ -14,9 +14,10 @@
   },
   "diarization": {
     "enabled": true,
-    "seg_model": "sherpa-onnx-pyannote-segmentation-3-0/model.onnx",
-    "emb_model": "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
-    "threshold": 0.5
+    "engine": "remote",
+    "api_url": "http://127.0.0.1:8000",
+    "request_timeout": 300,
+    "min_speaker_duration": 2.0
   },
   "ollama": {
     "base_url": "http://127.0.0.1:11434",

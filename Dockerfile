@@ -2,8 +2,9 @@
 # No GPU and no Hugging Face token are required at build or run time:
 #   - STT can be delegated to an OpenAI-compatible endpoint (e.g. llama-swap)
 #     via OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_DEFAULT_STT_MODEL.
-#   - Diarization runs locally via sherpa-onnx CPU wheels; models auto-download
-#     to WHISPER_MODELS_DIR on first use (mount a volume there to persist them).
+#   - Diarization is remote-only: an HTTP /diarize sidecar (e.g. the
+#     Nemotron-3 model hosted by llama-swap) via DIARIZATION_API_URL.
+#     No local diarization models are shipped or downloaded (AH-18).
 # The app (uvicorn) binds 0.0.0.0:8000 by default (see config.py HOST/PORT).
 FROM python:3.12-slim
 
