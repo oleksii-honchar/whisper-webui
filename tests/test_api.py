@@ -309,9 +309,10 @@ def test_served_css_scrolls_only_the_viewports():
 def test_app_js_cache_buster_matches_shipped_asset():
     response = client.get("/")
     assert response.status_code == 200
-    assert "/static/app.js?v=5.1" in response.text, (
+    assert "/static/app.js?v=5.2" in response.text, (
         "index.html must bump the app.js cache-bust version whenever app.js changes "
-        "(AH-16/AH-16b shipped word-renderer fixes under the stale ?v=5.0)"
+        "(AH-16/AH-16b shipped word-renderer fixes under the stale ?v=5.0; "
+        "AH-17 bumped to 5.2 for the badge-removal app.js change)"
     )
 
 

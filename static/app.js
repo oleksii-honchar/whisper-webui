@@ -70,7 +70,6 @@ document.addEventListener("DOMContentLoaded", () => {
   let ondemandSummaryActiveLevel = "bullets";
 
   const diarizationCheckbox = document.getElementById("diarization-checkbox");
-  const diarizationBadge = document.getElementById("diarization-badge");
   const numSpeakersSelect = document.getElementById("num-speakers-select");
 
   const openSettingsBtn = document.getElementById("open-settings-btn");
@@ -269,18 +268,6 @@ document.addEventListener("DOMContentLoaded", () => {
           <span class="w-2 h-2 rounded-full bg-amber-400"></span>
           <span>Ollama Offline / Remote</span>
         `;
-      }
-
-      if (data.diarization_engines) {
-        const availableEngine = data.diarization_engines.find((e) => e.available);
-        if (availableEngine && diarizationBadge) {
-          diarizationBadge.className = "text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium";
-          diarizationBadge.textContent = "ONNX Ready";
-        } else if (diarizationBadge) {
-          diarizationBadge.className = "text-[10px] px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 font-medium";
-          diarizationBadge.textContent = "Models Missing";
-          if (diarizationCheckbox) diarizationCheckbox.checked = false;
-        }
       }
 
       await loadLlmModels();
