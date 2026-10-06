@@ -29,6 +29,55 @@ logger = logging.getLogger(__name__)
 # sherpa's blocking process() — report elapsed seconds instead, never fake %).
 DIARIZATION_HEARTBEAT_SECONDS = 30.0
 
+# AH-14 Option B: utterance merge parameters (readability rule confirmed by
+# the user 2026-10-06, materials/evidence-AH14-diagnosis.txt §3).
+UTTERANCE_MERGE_MAX_GAP_S = 0.5
+UTTERANCE_MERGE_MAX_DURATION_S = 30.0
+UTTERANCE_MERGE_MAX_TEXT_CHARS = 200
+_SENTENCE_FINAL_CHARS = (".", "!", "?", "…")
+
+
+def _ends_sentence(text: str) -> bool:
+    t = text.rstrip()
+    return bool(t) and t.endswith(_SENTENCE_FINAL_CHARS)
+
+
+def merge_segments_into_utterances(segments: list[Segment]) -> list[Segment]:
+    """AH-14 Option B: re-merge engine segments into utterance units.
+
+    The engine emits short model-driven segments (median 2.0 s, 63% ending
+    mid-sentence — AH-14 diagnosis). Merge consecutive SAME-speaker segments
+    when the gap is < 0.5 s; break at sentence-final punctuation ending the
+    text, at a speaker change, or at the caps (merged duration ≤ 30 s,
+    merged text ≤ 200 chars). Merged segments: start = first.start,
+    end = last.end, speaker preserved, text joined with single spaces,
+    words concatenated. Input segments are never mutated — the result JSON
+    keeps them as provenance; exports and speaker turns use this view.
+    """
+    merged: list[Segment] = []
+    cur: Segment | None = None
+    for seg in segments:
+        if cur is not None:
+            gap = seg.start - cur.end
+            same_speaker = (cur.speaker or "Speaker 0") == (seg.speaker or "Speaker 0")
+            candidate_text = (cur.text + " " + seg.text.strip()).strip()
+            if (
+                same_speaker
+                and gap < UTTERANCE_MERGE_MAX_GAP_S
+                and not _ends_sentence(cur.text)
+                and seg.end - cur.start <= UTTERANCE_MERGE_MAX_DURATION_S
+                and len(candidate_text) <= UTTERANCE_MERGE_MAX_TEXT_CHARS
+            ):
+                cur.text = candidate_text
+                cur.end = seg.end
+                cur.words = cur.words + list(seg.words)
+                continue
+        cur = seg.model_copy(deep=True)
+        merged.append(cur)
+    for idx, m in enumerate(merged):
+        m.id = idx
+    return merged
+
 
 def _diarize_worker(audio: Any, num_speakers: int, cluster_threshold: float, engine: str):
     """Process-pool worker for the diarization phase (P13, DEC-9; R4/DEC-14).
@@ -101,9 +150,11 @@ class JobManager:
 
         from transcribers.base import Segment, TranscriptionResult
         segments = [Segment(**s) for s in segments_data]
+        # AH-14 Option B consistency: exports/turns regenerate from the same
+        # merged utterance view the pipeline stored; segments stay original.
         res = TranscriptionResult(
             text=job.result.get("text", ""),
-            segments=segments,
+            segments=merge_segments_into_utterances(segments),
             language=job.result.get("language", "auto"),
             duration=job.result.get("duration", 0.0),
         )
@@ -375,6 +426,19 @@ class JobManager:
                     except Exception as diar_err:
                         logger.warning("Diarization failed for job %s: %s", job_id, diar_err)
 
+            # AH-14 Option B: exports and speaker turns are generated from the
+            # merged utterance view (readability rule, user-approved); the
+            # per-segment list in the result keeps the ORIGINAL segments as
+            # provenance. rename_speaker regenerates both views consistently.
+            from transcribers.base import TranscriptionResult
+            merged_segments = merge_segments_into_utterances(transcription_result.segments)
+            export_result = TranscriptionResult(
+                text=transcription_result.text,
+                segments=merged_segments,
+                language=transcription_result.language,
+                duration=transcription_result.duration,
+            )
+
             job_result: dict[str, Any] = {
                 "task_id": job_id,
                 "filename": job.filename,
@@ -383,12 +447,12 @@ class JobManager:
                 "engine_used": transcriber.name,
                 "model_used": whisper_model,
                 "num_speakers": num_speakers_detected,
-                "speaker_turns": transcription_result.get_speaker_turns(),
-                "text": transcription_result.to_txt(),
-                "srt": transcription_result.to_srt(),
-                "vtt": transcription_result.to_vtt(),
-                "ass": transcription_result.to_ass(),
-                "word_vtt": transcription_result.to_word_vtt(),
+                "speaker_turns": export_result.get_speaker_turns(),
+                "text": export_result.to_txt(),
+                "srt": export_result.to_srt(),
+                "vtt": export_result.to_vtt(),
+                "ass": export_result.to_ass(),
+                "word_vtt": export_result.to_word_vtt(),
                 "segments": [s.model_dump() for s in transcription_result.segments],
                 "polished": None,
                 "summary": None,

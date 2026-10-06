@@ -518,3 +518,202 @@ def test_sherpa_diarizer_logs_start_end_with_duration_and_rtf(caplog):
     msgs = [r.getMessage() for r in caplog.records if r.name == "diarization.sherpa_diarizer"]
     assert any("started" in m.lower() and "2.0" in m for m in msgs), "diarization start log with audio duration"
     assert any("done" in m.lower() and "RTF" in m for m in msgs), "diarization end log with duration and RTF"
+
+
+# ---------------------------------------------------------------------------
+# AH-14 Option B — utterance merge after align_speakers_to_segments.
+# Merge consecutive SAME-speaker segments when gap < 0.5 s; break at
+# sentence-final punctuation ([.!?…]) ending the text, at a speaker change,
+# or at the caps (merged duration ≤ 30 s, merged text ≤ 200 chars).
+# The result JSON keeps the ORIGINAL segments (provenance); exports and
+# speaker_turns are generated from the merged view — kept consistent
+# through rename_speaker as well.
+# ---------------------------------------------------------------------------
+
+from jobs import merge_segments_into_utterances
+
+
+def _seg(sid: int, start: float, end: float, text: str, speaker: str | None = None, words=None) -> Segment:
+    return Segment(id=sid, start=start, end=end, text=text, speaker=speaker, words=list(words or []))
+
+
+def _w(word: str, start: float, end: float):
+    from transcribers.base import Word
+    return Word(word=word, start=start, end=end)
+
+
+def test_merge_consecutive_same_speaker_small_gap():
+    segs = [
+        _seg(0, 0.0, 2.0, "Перша репліка", "spk0", [_w("Перша", 0.0, 1.0), _w(" репліка", 1.0, 2.0)]),
+        _seg(1, 2.2, 4.0, "друга частина", "spk0", [_w(" друга", 2.2, 3.0), _w(" частина", 3.0, 4.0)]),
+        _seg(2, 4.1, 6.0, "третя", "spk0", [_w(" третя", 4.1, 6.0)]),
+    ]
+    merged = merge_segments_into_utterances(segs)
+
+    assert len(merged) == 1
+    m = merged[0]
+    assert m.start == 0.0 and m.end == 6.0
+    assert m.speaker == "spk0"
+    assert m.text == "Перша репліка друга частина третя"
+    assert [w.word for w in m.words] == ["Перша", " репліка", " друга", " частина", " третя"]
+
+
+def test_merge_no_merge_across_speaker_change():
+    segs = [
+        _seg(0, 0.0, 2.0, "говорить перший", "spk0"),
+        _seg(1, 2.1, 4.0, "говорить другий", "spk1"),
+        _seg(2, 4.2, 6.0, "знову перший", "spk0"),
+    ]
+    merged = merge_segments_into_utterances(segs)
+    assert len(merged) == 3
+    assert [m.speaker for m in merged] == ["spk0", "spk1", "spk0"]
+
+
+@pytest.mark.parametrize("terminal", [".", "!", "?", "…"])
+def test_merge_breaks_at_sentence_final_punctuation(terminal):
+    segs = [
+        _seg(0, 0.0, 2.0, f"Речення закінчене{terminal}", "spk0"),
+        _seg(1, 2.1, 4.0, "Наступне речення", "spk0"),
+    ]
+    merged = merge_segments_into_utterances(segs)
+    assert len(merged) == 2
+    assert merged[0].text == f"Речення закінчене{terminal}"
+    assert merged[1].text == "Наступне речення"
+
+
+def test_merge_gap_at_or_above_half_second_breaks():
+    segs = [
+        _seg(0, 0.0, 2.0, "перша", "spk0"),
+        _seg(1, 2.5, 4.0, "друга", "spk0"),  # gap exactly 0.5 → no merge
+    ]
+    assert len(merge_segments_into_utterances(segs)) == 2
+
+    segs_ok = [
+        _seg(0, 0.0, 2.0, "перша", "spk0"),
+        _seg(1, 2.49, 4.0, "друга", "spk0"),  # gap 0.49 < 0.5 → merge
+    ]
+    assert len(merge_segments_into_utterances(segs_ok)) == 1
+
+
+def test_merge_duration_cap_30s():
+    # 12 s segments, gap 0.1 s: two fit (24.1 s), the third would reach 36.2 s > 30 s
+    segs = [
+        _seg(0, 0.0, 12.0, "a" * 50, "spk0"),
+        _seg(1, 12.1, 24.0, "b" * 50, "spk0"),
+        _seg(2, 24.1, 36.0, "c" * 50, "spk0"),
+    ]
+    merged = merge_segments_into_utterances(segs)
+    assert len(merged) == 2
+    assert merged[0].start == 0.0 and merged[0].end == 24.0
+    assert merged[0].end - merged[0].start <= 30.0
+    assert merged[1].start == 24.1 and merged[1].end == 36.0
+
+
+def test_merge_text_cap_200_chars():
+    segs = [
+        _seg(0, 0.0, 2.0, "a" * 120, "spk0"),
+        _seg(1, 2.1, 4.0, "b" * 120, "spk0"),  # 120+1+120 = 241 > 200 → break
+    ]
+    merged = merge_segments_into_utterances(segs)
+    assert len(merged) == 2
+    assert all(len(m.text) <= 200 for m in merged)
+
+
+def test_merge_none_speaker_groups_merge():
+    """No diarization (speaker None) — the readability rule still applies."""
+    segs = [
+        _seg(0, 0.0, 2.0, "одна думка", None),
+        _seg(1, 2.2, 4.0, "продовження", None),
+    ]
+    merged = merge_segments_into_utterances(segs)
+    assert len(merged) == 1
+    assert merged[0].text == "одна думка продовження"
+
+
+def test_merge_preserves_valid_timestamps_and_never_mutates_input():
+    segs = [
+        _seg(0, 1.0, 2.0, "перша", "spk0"),
+        _seg(1, 2.1, 3.0, "друга", "spk0"),
+        _seg(2, 10.0, 12.0, "інша", "spk0"),  # gap 7 s → own group
+    ]
+    merged = merge_segments_into_utterances(segs)
+    assert len(merged) == 2
+    for m in merged:
+        assert m.start <= m.end
+    assert (merged[0].start, merged[0].end) == (1.0, 3.0)
+    assert (merged[1].start, merged[1].end) == (10.0, 12.0)
+    # originals untouched (the result JSON keeps them as provenance)
+    assert [(s.start, s.end, s.text) for s in segs] == [
+        (1.0, 2.0, "перша"), (2.1, 3.0, "друга"), (10.0, 12.0, "інша")
+    ]
+
+
+# --- pipeline wiring: result keeps ORIGINAL segments; exports use merged ---
+
+def _ah14_close_gap_result() -> TranscriptionResult:
+    segments = [
+        _seg(0, 0.0, 2.0, "Перша репліка", None, [_w("Перша", 0.0, 1.0), _w(" репліка", 1.0, 2.0)]),
+        _seg(1, 2.2, 4.0, "друга частина.", None, [_w(" друга", 2.2, 3.0), _w(" частина.", 3.0, 4.0)]),
+        _seg(2, 4.3, 6.0, "третя репліка.", None, [_w(" третя", 4.3, 5.0), _w(" репліка.", 5.0, 6.0)]),
+    ]
+    return TranscriptionResult(
+        text="Перша репліка друга частина. третя репліка.",
+        segments=segments,
+        language="uk",
+        duration=AUDIO_DURATION_S,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_result_keeps_original_segments_and_merged_exports(tmp_path: Path):
+    """AH-14 B wiring: job.result["segments"] = ORIGINAL segments (provenance);
+    srt/speaker_turns are generated from the merged view."""
+    manager = JobManager()
+    job = manager.create_job("ah14.wav")
+
+    await _run_pipeline_with_fakes(
+        manager, job.job_id, _tmp_media(tmp_path),
+        transcribe_impl=lambda audio, **kw: _ah14_close_gap_result(),
+    )
+
+    assert job.result is not None
+    # provenance: the per-segment list still contains the ORIGINAL segments
+    assert len(job.result["segments"]) == 3
+    assert [s["text"] for s in job.result["segments"]] == [
+        "Перша репліка", "друга частина.", "третя репліка."
+    ]
+    # exports use the merged view: "Перша репліка" has no terminal punctuation
+    # and gaps are < 0.5 s → one merged cue; the "." after "частина" breaks.
+    cues = job.result["srt"].count("-->")
+    assert cues == 2, "srt must carry merged cues (2), not the original 3"
+    assert "Перша репліка друга частина." in job.result["srt"]
+    turns = job.result["speaker_turns"]
+    assert len(turns) == 1
+    assert turns[0]["text"] == "Перша репліка друга частина. третя репліка."
+    assert turns[0]["start"] == 0.0 and turns[0]["end"] == 6.0
+
+
+def test_rename_speaker_keeps_merged_exports_consistent():
+    """rename_speaker regenerates exports from the merged view too — the
+    merged/original split must not drift after a rename."""
+    manager = JobManager()
+    job = manager.create_job("ah14.wav")
+    job.result = {
+        "text": "",
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 2.0, "text": "Перша репліка", "speaker": "Speaker 0", "words": []},
+            {"id": 1, "start": 2.2, "end": 4.0, "text": "друга частина.", "speaker": "Speaker 0", "words": []},
+        ],
+        "language": "uk",
+        "duration": 4.0,
+    }
+
+    updated = manager.rename_speaker(job.job_id, "Speaker 0", "Alice")
+    assert updated is not None
+    # provenance preserved: original segments, renamed
+    assert len(updated["segments"]) == 2
+    assert all(s["speaker"] == "Alice" for s in updated["segments"])
+    # exports regenerated from the merged view: one cue, not two
+    assert updated["srt"].count("-->") == 1
+    assert "Alice: Перша репліка друга частина." in updated["srt"]
+    assert updated["speaker_turns"][0]["text"] == "Перша репліка друга частина."
